@@ -632,6 +632,21 @@ public class MainActivity extends FlutterActivity {
                         break;
                     }
                     
+                    case "setSmartMediaEnabled": {
+                        // V3.6: Smart Media Rear Controller toggle
+                        boolean enabled = (boolean) call.argument("enabled");
+                        
+                        SharedPreferences prefs = getSharedPreferences("mrss_settings", MODE_PRIVATE);
+                        prefs.edit().putBoolean("smart_media_enabled", enabled).apply();
+                        
+                        // Notify NotificationService to reload settings
+                        sendBroadcast(new Intent("com.tgwgroup.MiRearScreenSwitcher.RELOAD_NOTIFICATION_SETTINGS"));
+                        
+                        Log.d(TAG, "Smart Media Controller set to: " + enabled);
+                        result.success(true);
+                        break;
+                    }
+                    
                     case "setChargingAlwaysOnEnabled": {
                         // V3.5: 设置充电动画常亮开关
                         boolean enabled = (boolean) call.argument("enabled");

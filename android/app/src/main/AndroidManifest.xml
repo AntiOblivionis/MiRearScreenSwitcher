@@ -226,6 +226,21 @@
             </intent-filter>
         </activity>
         
+        <!-- V3.6: Smart Media Rear Controller -->
+        <activity
+            android:name=".RearMediaActivity"
+            android:exported="true"
+            android:theme="@style/LaunchTheme"
+            android:showForAllUsers="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize"
+            android:launchMode="singleInstance"
+            android:excludeFromRecents="true"
+            android:taskAffinity=".RearMediaActivity" />
+        
         <activity
             android:name=".MainActivity"
             android:exported="true"

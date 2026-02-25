@@ -38,6 +38,14 @@ import android.util.Log;
 
 import java.util.HashSet;
 import java.util.Set;
+import java.util.List;
+
+import android.media.session.MediaController;
+import android.media.session.MediaSessionManager;
+import android.media.session.PlaybackState;
+import android.media.MediaMetadata;
+import android.graphics.Bitmap;
+import java.io.ByteArrayOutputStream;
 
 import rikka.shizuku.Shizuku;
 
@@ -56,6 +64,7 @@ public class NotificationService extends NotificationListenerService {
     private boolean onlyWhenLocked = false; // 仅倒扣手机时通知（默认关闭）
     private boolean notificationDarkMode = false; // 通知暗夜模式（默认关闭）
     private boolean serviceEnabled = false; // 服务是否启用
+    private boolean smartMediaEnabled = false; // Smart Media Controller 状态
     private ITaskService taskService; // 自己的TaskService实例
     private SharedPreferences prefs;
     private PowerManager.WakeLock wakeLock;
@@ -65,8 +74,20 @@ public class NotificationService extends NotificationListenerService {
     private Sensor mainProximitySensor; // 主屏接近传感器
     private boolean isMainScreenCovered = false; // 主屏是否被遮盖
     
+    // 媒体播放检测相关
+    private MediaSessionManager mediaSessionManager;
+    private MediaController activeMediaController = null;
+    private final android.os.Handler mediaTimeoutHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private Runnable mediaTimeoutRunnable;
+    private ComponentName componentName;
+    private final java.util.Map<MediaController, MediaController.Callback> activeMediaCallbacks = new java.util.HashMap<>();
+    
     // 静态实例，供外部访问
     private static NotificationService instance;
+    
+    public static NotificationService getInstance() {
+        return instance;
+    }
     
     public static ITaskService getTaskService() {
         return instance != null ? instance.taskService : null;
@@ -176,6 +197,17 @@ public class NotificationService extends NotificationListenerService {
         startForeground(NOTIFICATION_ID, RearScreenKeeperService.createServiceNotification(this));
         Log.d(TAG, "✓ 前台服务已启动");
         
+        // 注册MediaSession回调
+        componentName = new ComponentName(this, NotificationService.class);
+        mediaSessionManager = (MediaSessionManager) getSystemService(Context.MEDIA_SESSION_SERVICE);
+        try {
+            mediaSessionManager.addOnActiveSessionsChangedListener(sessionsChangedListener, componentName);
+            List<MediaController> activeSessions = mediaSessionManager.getActiveSessions(componentName);
+            sessionsChangedListener.onActiveSessionsChanged(activeSessions);
+        } catch (SecurityException e) {
+            Log.e(TAG, "缺少监听MediaSession的权限", e);
+        }
+
         loadSettings();
     }
     
@@ -225,14 +257,29 @@ public class NotificationService extends NotificationListenerService {
     }
     
     private void loadSettings() {
+        if (prefs == null) return;
         try {
+            boolean oldSmartMediaEnabled = smartMediaEnabled;
             selectedApps = prefs.getStringSet("notification_selected_apps", new HashSet<>());
             privacyHideTitle = prefs.getBoolean("notification_privacy_hide_title", false);
             privacyHideContent = prefs.getBoolean("notification_privacy_hide_content", false);
             followDndMode = prefs.getBoolean("notification_follow_dnd_mode", true);
             onlyWhenLocked = prefs.getBoolean("notification_only_when_locked", false);
             notificationDarkMode = prefs.getBoolean("notification_dark_mode", false);
+            smartMediaEnabled = prefs.getBoolean("smart_media_enabled", false); // Add toggle detection
             // 注意：不在这里重新设置 serviceEnabled，保持 loadNotificationServiceSettings() 的值
+            
+            // Re-trigger checking if newly enabled
+            if (!oldSmartMediaEnabled && smartMediaEnabled && mediaSessionManager != null && componentName != null) {
+                try {
+                    sessionsChangedListener.onActiveSessionsChanged(mediaSessionManager.getActiveSessions(componentName));
+                } catch (SecurityException e) {
+                    Log.e(TAG, "Failed pushing initial media sessions", e);
+                }
+            } else if (oldSmartMediaEnabled && !smartMediaEnabled) {
+                Log.d(TAG, "🎵 Smart Media App toggle disabled. Tearing down immediately.");
+                hideMediaWidget();
+            }
             
             Log.d(TAG, "⚙️ 已加载设置");
             Log.d(TAG, "   - 启用状态: " + serviceEnabled + " (由loadNotificationServiceSettings设置)");
@@ -565,6 +612,48 @@ public class NotificationService extends NotificationListenerService {
             releaseWakeLock();
         }
     }
+    
+    @Override
+    public void onNotificationRemoved(StatusBarNotification sbn) {
+        super.onNotificationRemoved(sbn);
+        if (RearMediaActivity.activeInstance == null) return;
+
+        try {
+            Notification notification = sbn.getNotification();
+            if (notification != null && notification.extras != null) {
+                String template = notification.extras.getString(Notification.EXTRA_TEMPLATE);
+                if (template != null && template.contains("MediaStyle")) {
+                    Log.d(TAG, "🎵 Media notification removed: " + sbn.getPackageName());
+                    
+                    boolean shouldTeardown = false;
+                    if (activeMediaController != null && activeMediaController.getPackageName().equals(sbn.getPackageName())) {
+                         Log.d(TAG, "🎵 Active Media App matches removed notification. Tearing down immediately.");
+                         shouldTeardown = true;
+                    } else if (activeMediaController == null) {
+                         shouldTeardown = true;
+                    }
+
+                    if (shouldTeardown) {
+                         if (mediaTimeoutRunnable != null) {
+                             mediaTimeoutHandler.removeCallbacks(mediaTimeoutRunnable);
+                             mediaTimeoutRunnable = null;
+                         }
+                         if (RearMediaActivity.activeInstance != null) {
+                             RearMediaActivity.activeInstance.finish();
+                         }
+                         if (taskService != null) {
+                             try {
+                                 taskService.enableSubScreenLauncher();
+                                 taskService.executeShellCommand("am start --display 1 -n com.xiaomi.mirror/.SubscreenLauncher");
+                             } catch (Exception e) {}
+                         }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "❌ Error handling removed notification: ", e);
+        }
+    }
 
     private void acquireWakeLock(long timeoutMs) {
         try {
@@ -703,6 +792,286 @@ public class NotificationService extends NotificationListenerService {
             // 不需要处理
         }
     };
+
+    /**
+     * Media Session Monitor block
+     */
+    private final MediaSessionManager.OnActiveSessionsChangedListener sessionsChangedListener = new MediaSessionManager.OnActiveSessionsChangedListener() {
+        @Override
+        public void onActiveSessionsChanged(List<MediaController> controllers) {
+            if (!smartMediaEnabled) return;
+
+            // Clear old callbacks
+            for (java.util.Map.Entry<MediaController, MediaController.Callback> entry : activeMediaCallbacks.entrySet()) {
+                try {
+                    entry.getKey().unregisterCallback(entry.getValue());
+                } catch (Exception e) {}
+            }
+            activeMediaCallbacks.clear();
+
+            if (controllers != null) {
+                for (MediaController controller : controllers) {
+                    MediaController.Callback cb = new MediaController.Callback() {
+                        @Override
+                        public void onPlaybackStateChanged(PlaybackState state) {
+                            super.onPlaybackStateChanged(state);
+                            // Whenever ANY controller changes state, re-evaluate all sessions
+                            if (mediaSessionManager != null && componentName != null) {
+                                try {
+                                    sessionsChangedListener.onActiveSessionsChanged(mediaSessionManager.getActiveSessions(componentName));
+                                } catch (SecurityException e) {}
+                            }
+                        }
+                        @Override
+                        public void onMetadataChanged(MediaMetadata metadata) {
+                            super.onMetadataChanged(metadata);
+                            // Only push if this is the active one
+                            if (controller.equals(activeMediaController)) {
+                                pushCurrentMediaStateToFlutter();
+                            }
+                        }
+                    };
+                    try {
+                        controller.registerCallback(cb);
+                        activeMediaCallbacks.put(controller, cb);
+                    } catch (Exception e) {}
+                }
+            }
+
+            // Find playing session
+            MediaController playingController = null;
+            MediaController pausedController = null;
+            
+            if (controllers != null) {
+                for (MediaController mc : controllers) {
+                    PlaybackState pb = mc.getPlaybackState();
+                    if (pb != null && (pb.getState() == PlaybackState.STATE_PLAYING || pb.getState() == PlaybackState.STATE_BUFFERING)) {
+                        playingController = mc;
+                        break;
+                    } else if (pb != null && pb.getState() == PlaybackState.STATE_PAUSED) {
+                        if (pausedController == null) pausedController = mc;
+                    }
+                }
+            }
+
+            MediaController targetController = playingController != null ? playingController : pausedController;
+            if (targetController == null && controllers != null && !controllers.isEmpty()) {
+                targetController = controllers.get(0);
+            }
+
+            activeMediaController = targetController;
+
+            if (playingController != null) {
+                Log.d(TAG, "🎵 Media Playback Detected");
+                if (mediaTimeoutRunnable != null) {
+                    mediaTimeoutHandler.removeCallbacks(mediaTimeoutRunnable);
+                    mediaTimeoutRunnable = null;
+                }
+
+                if (RearMediaActivity.activeInstance == null) {
+                    if (taskService == null) {
+                        Log.w(TAG, "⚠️ TaskService未连接，尝试重新绑定...");
+                        bindTaskService();
+                    }
+                    if (taskService != null) {
+                        try {
+                            Log.d(TAG, "🎵 Launching RearMediaActivity on Display 1 via Shizuku");
+                            String compName = getPackageName() + "/" + RearMediaActivity.class.getName();
+                            taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
+                            try { Thread.sleep(50); } catch (Exception e) {}
+                            taskService.disableSubScreenLauncher();
+                            taskService.executeShellCommand(String.format("am start --display 1 -n %s", compName));
+                        } catch (Exception e) {}
+                    }
+                }
+                
+                pushCurrentMediaStateToFlutter();
+
+            } else if (pausedController != null) {
+                 if (RearMediaActivity.activeInstance != null && mediaTimeoutRunnable == null) {
+                      pushCurrentMediaStateToFlutter();
+                      mediaTimeoutRunnable = () -> {
+                          if (RearMediaActivity.activeInstance != null) {
+                              RearMediaActivity.activeInstance.finish();
+                          }
+                          if (taskService != null) {
+                              try {
+                                  taskService.enableSubScreenLauncher();
+                                  taskService.executeShellCommand("am start --display 1 -n com.xiaomi.mirror/.SubscreenLauncher");
+                              } catch (Exception e) {}
+                          }
+                          mediaTimeoutRunnable = null;
+                      };
+                      mediaTimeoutHandler.postDelayed(mediaTimeoutRunnable, 15000);
+                 }
+            } else if (controllers == null || controllers.isEmpty()) {
+                 Log.d(TAG, "🎵 All Media Sessions Cleared. Tearing down immediately.");
+                 if (mediaTimeoutRunnable != null) {
+                     mediaTimeoutHandler.removeCallbacks(mediaTimeoutRunnable);
+                     mediaTimeoutRunnable = null;
+                 }
+                 if (RearMediaActivity.activeInstance != null) {
+                     RearMediaActivity.activeInstance.finish();
+                 }
+                 if (taskService != null) {
+                     try {
+                         taskService.enableSubScreenLauncher();
+                         taskService.executeShellCommand("am start --display 1 -n com.xiaomi.mirror/.SubscreenLauncher");
+                     } catch (Exception e) {}
+                 }
+            }
+        }
+    };
+
+    private String lastMediaTitle = "";
+    private int lastPlaybackState = -1;
+
+    public void pushCurrentMediaStateToFlutter() {
+        if (activeMediaController == null || RearMediaActivity.activeInstance == null) return;
+        
+        PlaybackState pbState = activeMediaController.getPlaybackState();
+        MediaMetadata metadata = activeMediaController.getMetadata();
+        
+        boolean isPlaying = false;
+        int currentState = -1;
+        if (pbState != null) {
+            currentState = pbState.getState();
+            isPlaying = pbState.getState() == PlaybackState.STATE_PLAYING;
+        }
+        
+        String title = "Unknown";
+        String artist = "Unknown";
+        byte[] artworkBytes = new byte[0];
+
+        if (metadata != null) {
+            title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE);
+            if (title == null) title = "Unknown";
+            artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST);
+            Bitmap artwork = metadata.getBitmap(MediaMetadata.METADATA_KEY_ART);
+            if (artwork == null) {
+                artwork = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
+            }
+            if (artwork != null) {
+                ByteArrayOutputStream stream = new ByteArrayOutputStream();
+                artwork.compress(Bitmap.CompressFormat.PNG, 100, stream);
+                artworkBytes = stream.toByteArray();
+            }
+        }
+        
+        // Smart Wakeup Logic: Only wake display 1 if the song or play state actually changed
+        boolean stateOrTitleChanged = false;
+        if (!title.equals(lastMediaTitle)) {
+             stateOrTitleChanged = true;
+             lastMediaTitle = title;
+        }
+        if (currentState != lastPlaybackState) {
+             stateOrTitleChanged = true;
+             lastPlaybackState = currentState;
+        }
+
+        if (stateOrTitleChanged && taskService != null) {
+             try {
+                 Log.d(TAG, "🎵 Song/State changed, waking up rear screen to render update.");
+                 taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
+             } catch (Exception e) {}
+        }
+        
+        String appName = "Music";
+        byte[] appIconBytes = new byte[0];
+        try {
+            String pkgName = activeMediaController.getPackageName();
+            android.content.pm.PackageManager pm = getPackageManager();
+            android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkgName, 0);
+            if (ai != null) {
+                CharSequence label = pm.getApplicationLabel(ai);
+                if (label != null) appName = label.toString();
+            }
+            android.graphics.drawable.Drawable icon = pm.getApplicationIcon(pkgName);
+            Bitmap iconBitmap = null;
+            if (icon instanceof android.graphics.drawable.BitmapDrawable) {
+                iconBitmap = ((android.graphics.drawable.BitmapDrawable) icon).getBitmap();
+            } else if (icon instanceof android.graphics.drawable.AdaptiveIconDrawable) {
+                int width = Math.max(icon.getIntrinsicWidth(), 1);
+                int height = Math.max(icon.getIntrinsicHeight(), 1);
+                iconBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                android.graphics.Canvas canvas = new android.graphics.Canvas(iconBitmap);
+                icon.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+                icon.draw(canvas);
+            }
+            if (iconBitmap != null) {
+                Bitmap scaled = Bitmap.createScaledBitmap(iconBitmap, 96, 96, true);
+                ByteArrayOutputStream stream2 = new ByteArrayOutputStream();
+                scaled.compress(Bitmap.CompressFormat.PNG, 100, stream2);
+                appIconBytes = stream2.toByteArray();
+            }
+        } catch (Exception e) {}
+        long currentPos = 0;
+        long duration = 0;
+        float playbackSpeed = 1.0f;
+        try {
+            if (pbState != null) {
+                long pos = pbState.getPosition();
+                long lastUpdate = pbState.getLastPositionUpdateTime();
+                playbackSpeed = pbState.getPlaybackSpeed();
+                if (isPlaying && lastUpdate > 0) {
+                    long timeDelta = android.os.SystemClock.elapsedRealtime() - lastUpdate;
+                    currentPos = pos + (long)(timeDelta * playbackSpeed);
+                } else {
+                    currentPos = pos;
+                }
+            }
+            if (metadata != null) {
+                if (metadata.containsKey(MediaMetadata.METADATA_KEY_DURATION)) {
+                    duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
+                }
+            }
+        } catch (Exception e) {}
+        
+        Log.d(TAG, "🎵 Dispatching Media to flutter overlay: " + title);
+        RearMediaActivity.activeInstance.updateMediaState(title, artist, artworkBytes, isPlaying, appName, appIconBytes, currentPos, duration, (double)playbackSpeed);
+    }
+
+    public void toggleMediaPlayback() {
+        if (activeMediaController != null) {
+             PlaybackState pbState = activeMediaController.getPlaybackState();
+             if (pbState != null && pbState.getState() == PlaybackState.STATE_PLAYING) {
+                 activeMediaController.getTransportControls().pause();
+             } else {
+                 activeMediaController.getTransportControls().play();
+             }
+        }
+    }
+
+    public void skipNextMedia() {
+        if (activeMediaController != null) {
+             activeMediaController.getTransportControls().skipToNext();
+        }
+    }
+
+    public void skipPrevMedia() {
+        if (activeMediaController != null) {
+             activeMediaController.getTransportControls().skipToPrevious();
+        }
+    }
+    
+    // Allows the Flutter layer to intentionally hide the media widget and show the clock
+    public void hideMediaWidget() {
+        Log.d(TAG, "🎵 User manually dismissed the Rear Media Widget via gesture.");
+        // Clear timeout runnable so it doesn't fire unexpectedly later
+        if (mediaTimeoutRunnable != null) {
+            mediaTimeoutHandler.removeCallbacks(mediaTimeoutRunnable);
+            mediaTimeoutRunnable = null;
+        }
+        if (RearMediaActivity.activeInstance != null) {
+            RearMediaActivity.activeInstance.finish();
+        }
+        if (taskService != null) {
+            try {
+                taskService.enableSubScreenLauncher();
+                taskService.executeShellCommand("am start --display 1 -n com.xiaomi.mirror/.SubscreenLauncher");
+            } catch (Exception e) {}
+        }
+    }
     
     @Override
     public void onListenerConnected() {
@@ -745,6 +1114,19 @@ public class NotificationService extends NotificationListenerService {
         
         // 注销主屏接近传感器
         unregisterMainProximitySensor();
+        
+        // Remove music hooks
+        try {
+             if (mediaSessionManager != null) {
+                  mediaSessionManager.removeOnActiveSessionsChangedListener(sessionsChangedListener);
+             }
+             for (java.util.Map.Entry<MediaController, MediaController.Callback> entry : activeMediaCallbacks.entrySet()) {
+                 try {
+                     entry.getKey().unregisterCallback(entry.getValue());
+                 } catch (Exception e) {}
+             }
+             activeMediaCallbacks.clear();
+        } catch (Exception e) {}
         
         // 清除实例
         instance = null;

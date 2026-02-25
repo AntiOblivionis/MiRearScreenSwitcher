@@ -22,6 +22,7 @@ import 'dart:typed_data';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'l10n/app_localizations.dart';
+import 'rear_media_widget.dart';
 
 void main() {
   // 设置沉浸式状态栏（透明状态栏）
@@ -88,7 +89,11 @@ class DisplaySwitcherApp extends StatelessWidget {
         // Fallback to English for all unsupported languages
         return const Locale('en', '');
       },
-      home: const HomePage(),
+      initialRoute: '/',
+      routes: {
+        '/': (context) => const HomePage(),
+        '/rearMedia': (context) => const RearMediaWidget(),
+      },
     );
   }
 }
@@ -140,6 +145,9 @@ class _HomePageState extends State<HomePage> {
 
   // V2.4: 通知功能
   bool _notificationEnabled = false; // 默认关闭（需要授权）
+
+  // V3.6: Smart Media Rear Controller
+  bool _smartMediaEnabled = false; // Default disabled
 
   @override
   void initState() {
@@ -465,6 +473,9 @@ class _HomePageState extends State<HomePage> {
         _notificationEnabled =
             prefs.getBool('notification_service_enabled') ??
             false; // V2.4: 加载背屏通知开关状态
+        _smartMediaEnabled =
+            prefs.getBool('smart_media_enabled') ??
+            false; // Smart Media Rear Controller 
       });
 
       // 启动充电服务（如果开关打开）
@@ -548,6 +559,12 @@ class _HomePageState extends State<HomePage> {
       // 如果开启，启动NotificationService
       if (enabled) {
         await _startNotificationService();
+      } else {
+        // V3.6: Smart media controller requires notifications. If notifications are disabled,
+        // force disable the smart media controller as well.
+        if (_smartMediaEnabled) {
+          await _toggleSmartMedia(false);
+        }
       }
 
       setState(() {
@@ -716,6 +733,41 @@ class _HomePageState extends State<HomePage> {
       // 切换失败，恢复原状态
       setState(() {
         _chargingAlwaysOnEnabled = !enabled;
+      });
+    }
+  }
+
+  // V3.6: Smart Media Rear Controller
+  Future<void> _toggleSmartMedia(bool enabled) async {
+    if (enabled) {
+      // 先检查权限
+      final bool hasPermission = await platform.invokeMethod(
+        'checkNotificationListenerPermission',
+      ) ?? false;
+      if (!hasPermission) {
+        // 打开设置页面授权
+        await platform.invokeMethod('openNotificationListenerSettings');
+        return;
+      }
+    }
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('smart_media_enabled', enabled);
+
+      // Notify native service to update listener states
+      await platform.invokeMethod('setSmartMediaEnabled', {
+        'enabled': enabled,
+      });
+
+      setState(() {
+        _smartMediaEnabled = enabled;
+      });
+      print('Smart Media Controller turned ${enabled ? "ON" : "OFF"}');
+    } catch (e) {
+      print('Failed to toggle Smart Media Controller: $e');
+      setState(() {
+        _smartMediaEnabled = !enabled;
       });
     }
   }
@@ -1460,6 +1512,58 @@ class _HomePageState extends State<HomePage> {
                 ),
 
                 const SizedBox(height: 20),
+
+                // V3.6: Smart Media Rear Controller Card
+                if (_notificationEnabled) ...[
+                  CustomPaint(
+                    painter: _SquircleBorderPainter(
+                      radius: _SquircleRadii.large,
+                      color: Colors.white.withOpacity(0.5),
+                      strokeWidth: 1.5,
+                    ),
+                    child: ClipPath(
+                      clipper: _SquircleClipper(
+                        cornerRadius: _SquircleRadii.large,
+                      ),
+                      child: BackdropFilter(
+                        filter: ImageFilter.blur(sigmaX: 0, sigmaY: 0),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 16,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.25),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Text(
+                                    AppLocalizations.of(context).translate('🎼 Smart media widget') ?? 'Smart media rear controller',
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.black87,
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  _GradientToggle(
+                                    value: _smartMediaEnabled,
+                                    onChanged: _toggleSmartMedia,
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+                ],
 
                 // 使用教程 - 可点击跳转到酷安帖子
                 CustomPaint(

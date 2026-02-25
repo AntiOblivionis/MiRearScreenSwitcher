@@ -296,7 +296,8 @@ public class RearScreenKeeperService extends Service implements SensorEventListe
 
                     // V2.3: 排除充电动画/通知动画（临时占用背屏，不应导致Service销毁）
                     if (rearForegroundApp != null && (rearForegroundApp.contains("RearScreenChargingActivity")
-                            || rearForegroundApp.contains("RearScreenNotificationActivity"))) {
+                            || rearForegroundApp.contains("RearScreenNotificationActivity")
+                            || rearForegroundApp.contains("RearMediaActivity"))) {
                         // 充电动画正在显示，跳过本次检查
                         handler.postDelayed(this, CHECK_TASK_INTERVAL_MS);
                         return;
