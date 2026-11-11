@@ -16,13 +16,13 @@ package com.tgwgroup.MiRearScreenSwitcher;
 import android.content.Context;
 import android.os.Build;
 import android.util.Log;
-import io.flutter.app.FlutterApplication;
+import android.app.Application;
 import rikka.sui.Sui;
 
 /**
  * 自定义Application - 初始化Shizuku
  */
-public class MyApplication extends FlutterApplication {
+public class MyApplication extends Application {
     
     private static final String TAG = "MyApplication";
     private static boolean isSui = false;

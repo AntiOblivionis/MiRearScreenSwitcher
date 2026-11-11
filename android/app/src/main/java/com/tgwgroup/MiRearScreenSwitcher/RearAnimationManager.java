@@ -22,6 +22,12 @@ import android.util.Log;
  */
 public class RearAnimationManager {
     private static final String TAG = "RearAnimationManager";
+    private static long generation;
+    static final java.util.concurrent.ExecutorService LAUNCHES = java.util.concurrent.Executors.newSingleThreadExecutor();
+    public static synchronized long getGeneration() { return generation; }
+    public static synchronized boolean isCurrent(AnimationType type, long token) {
+        return token == generation && currentAnimation == type;
+    }
     
     // 动画类型
     public enum AnimationType {
@@ -50,6 +56,7 @@ public class RearAnimationManager {
             return AnimationType.NONE;
         }
         
+        generation++;
         AnimationType oldAnimation = currentAnimation;
         
         if (oldAnimation != AnimationType.NONE) {
@@ -94,8 +101,8 @@ public class RearAnimationManager {
      * @param type 动画类型
      * @return 是否需要恢复官方Launcher
      */
-    public static synchronized boolean endAnimation(AnimationType type) {
-        if (currentAnimation != type) {
+    public static synchronized boolean endAnimation(AnimationType type, long token) {
+        if (currentAnimation != type || token != generation) {
             Log.w(TAG, String.format("⚠️ 尝试结束动画[%s]，但当前动画是[%s]", type, currentAnimation));
             return false;  // 不是当前动画，不需要恢复
         }

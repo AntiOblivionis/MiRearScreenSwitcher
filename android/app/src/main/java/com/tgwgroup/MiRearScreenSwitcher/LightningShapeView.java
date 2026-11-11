@@ -55,6 +55,22 @@ public class LightningShapeView extends View implements SensorEventListener {
     private float[] bubblePositions = new float[6]; // 气泡Y位置（受重力影响）
     private SensorManager sensorManager;
     private Sensor accelerometer;
+    private boolean visibleToUser;
+    private boolean sensorRegistered;
+    private boolean sensorAttempted;
+    private boolean hostResumed = true;
+    private boolean released;
+    private int displayRotation;
+    private boolean rearFacing;
+    private long sensorStartNanos;
+    private SensorEventListener activeSensorListener;
+    private final LiquidSurface surface = new LiquidSurface();
+    private final float[] mappedMotion = new float[3];
+    private final float[] bubblePoint = new float[2];
+    private static final float[] BUBBLE_X = {.2f, .4f, .6f, .8f, .3f, .7f};
+    private static final float[] BUBBLE_RADIUS = {6, 4, 3, 3.5f, 4.5f, 2.5f};
+    private final Paint highlightReflectionPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private int highlightWidth = -1, highlightHeight = -1;
     
     // V3.5: 全屏液体模式（不绘制闪电边框）
     private boolean fullScreenMode = false;
@@ -169,6 +185,8 @@ public class LightningShapeView extends View implements SensorEventListener {
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
+        surface.resize(w, h);
+        updateSensorRotation();
         
         // 使用Android的PathParser解析SVG路径
         // 原始SVG path data（从lightening.xml）
@@ -221,54 +239,15 @@ public class LightningShapeView extends View implements SensorEventListener {
     
     @Override
     protected void onDraw(Canvas canvas) {
-        long drawStartTime = System.nanoTime();  // 性能追踪开始
-        
         super.onDraw(canvas);
         
         int width = getWidth();
         int height = getHeight();
+        if (width <= 0 || height <= 0) return;
         
         // V3.5: 全屏液体模式 - 直接绘制液体，不裁剪为闪电形状
         if (fullScreenMode) {
             drawFullScreenLiquid(canvas, width, height);
-            
-            // V3.5: 性能追踪（修复bug + 增加帧间隔追踪）
-            long drawEndTime = System.nanoTime();
-            long drawTimeNanos = drawEndTime - drawStartTime;
-            totalDrawTime += drawTimeNanos;
-            
-            // 计算帧间隔
-            if (lastFrameTimeNanos > 0) {
-                long frameInterval = drawStartTime - lastFrameTimeNanos;
-                totalFrameInterval += frameInterval;
-            }
-            lastFrameTimeNanos = drawStartTime;
-            frameCount++;
-            
-            // 每60帧输出一次统计
-            if (frameCount % 60 == 0) {
-                float avgDrawTimeMs = (totalDrawTime / (float)frameCount) / 1_000_000f;  // 纳秒→毫秒
-                float currentDrawMs = drawTimeNanos / 1_000_000f;
-                float avgFrameIntervalMs = (totalFrameInterval / (float)(frameCount - 1)) / 1_000_000f;  // 平均帧间隔
-                
-                long currentTime = System.currentTimeMillis();
-                long timeSinceLastLog = currentTime - lastFrameTime;
-                float actualFps = (timeSinceLastLog > 0) ? (60000f / timeSinceLastLog) : 0;
-                
-                // 计算理论最大帧间隔（考虑绘制时间）
-                float drawTimeMs = currentDrawMs;
-                float maxTheoreticalFps = (drawTimeMs > 0) ? (1000f / drawTimeMs) : 999;
-                float vsyncFps = (avgFrameIntervalMs > 0) ? (1000f / avgFrameIntervalMs) : 0;
-                
-                Log.d("LightningPerf", String.format("📊 性能: FPS=%.1f, VSync=%.1fHz (间隔%.2fms), 平均绘制=%.2fms", 
-                    actualFps, vsyncFps, avgFrameIntervalMs, avgDrawTimeMs));
-                
-                lastFrameTime = currentTime;
-                totalDrawTime = 0;
-                totalFrameInterval = 0;
-                frameCount = 0;
-                lastFrameTimeNanos = 0;
-            }
             
             return;
         }
@@ -328,7 +307,7 @@ public class LightningShapeView extends View implements SensorEventListener {
                 updateWavePoints(width, waveOffset);
                 
                 // 使用预计算的波浪点
-                int pointCount = Math.min(width / 8, wavePoints.length);  // 减少绘制点数
+                int pointCount = Math.max(2, Math.min(width / 6, wavePoints.length));  // 减少绘制点数
                 for (int i = 0; i < pointCount; i++) {
                     float x = (float) i / (pointCount - 1) * width;
                     float wave = wavePoints[i];
@@ -401,17 +380,18 @@ public class LightningShapeView extends View implements SensorEventListener {
         canvas.save();
         canvas.clipPath(lightningPath);
         // 绘制左上角的小面积高光反射（复用Paint，避免每帧创建）
-        if (lastEdgeShineWidth != width) {
-            fullScreenEdgeShinePaint.setStyle(Paint.Style.FILL);
-            fullScreenEdgeShinePaint.setShader(new android.graphics.RadialGradient(
+        if (highlightWidth != width || highlightHeight != height) {
+            highlightReflectionPaint.setStyle(Paint.Style.FILL);
+            highlightReflectionPaint.setShader(new android.graphics.RadialGradient(
                 width * 0.25f, height * 0.2f, width * 0.3f,
                 new int[]{0x50FFFFFF, 0x20FFFFFF, 0x00FFFFFF},
                 new float[]{0f, 0.5f, 1f},
                 Shader.TileMode.CLAMP
             ));
-            lastEdgeShineWidth = width;
+            highlightWidth = width;
+            highlightHeight = height;
         }
-        canvas.drawPath(highlightPath, fullScreenEdgeShinePaint);
+        canvas.drawPath(highlightPath, highlightReflectionPaint);
         canvas.restore();
         
         // 恢复重力倾斜的变换
@@ -424,7 +404,7 @@ public class LightningShapeView extends View implements SensorEventListener {
     private void updateWavePoints(int width, float waveOffset) {
         if (lastWaveWidth != width || Math.abs(lastProcessedWaveOffset - waveOffset) > WAVE_UPDATE_THRESHOLD) {
             // V3.14: 恢复波浪点数，保证流畅度
-            int pointCount = Math.min(width / 6, wavePoints.length);
+            int pointCount = Math.max(2, Math.min(width / 6, wavePoints.length));
             for (int i = 0; i < pointCount; i++) {
                 float x = (float) i / (pointCount - 1) * width;
                 wavePoints[i] = (float) Math.sin((x / (float)width * 4 * Math.PI) + waveOffset) * 8f;
@@ -476,53 +456,43 @@ public class LightningShapeView extends View implements SensorEventListener {
         float bubble6Y = baseY + fillHeight * bubblePositions[5] + gravityOffsetY;
         canvas.drawCircle(bubble6X, bubble6Y, 2.5f, bubblePaint);
         
-        // 简单气泡上升逻辑
-        for (int i = 0; i < bubblePositions.length; i++) {
-            bubblePositions[i] -= 0.002f; // 固定上升速度
-            if (bubblePositions[i] < 0) {
-                bubblePositions[i] = 1.0f; // 从底部重新开始
-            }
-        }
+        // Positions advance with elapsed time in the frame callback, never with draw count.
     }
     
-    private long waveAnimationStartTime = 0;
+    private long lastFrameNanos;
+    private long nextFrameNanos;
     private android.view.Choreographer.FrameCallback frameCallback;
     
-    // V3.5: 性能追踪
-    private long lastFrameTime = 0;
-    private long frameCount = 0;
-    private long totalDrawTime = 0;
-    private long lastFrameTimeNanos = 0;  // 上一帧的纳秒时间
-    private long totalFrameInterval = 0;  // 帧间隔总和
-    
     /**
-     * 启动波浪动画（优化为120fps）
+     * 60 Hz maximum drawing, fixed-step physics, no work while hidden.
      */
     private void startWaveAnimation() {
         // 避免重复启动
-        if (frameCallback != null) {
-            return;
-        }
+        if (frameCallback != null || !visibleToUser || !isAttachedToWindow() || fillLevel <= 0) return;
         
         // 记录起始时间（使用实际帧时间）
-        waveAnimationStartTime = 0;
+        lastFrameNanos = nextFrameNanos = 0;
+        surface.resetClock();
         
         // 创建FrameCallback
         frameCallback = new android.view.Choreographer.FrameCallback() {
             @Override
             public void doFrame(long frameTimeNanos) {
+                if (!visibleToUser || !isAttachedToWindow() || frameCallback != this) return;
                 if (fillLevel > 0) {
-                    // 初始化起始时间
-                    if (waveAnimationStartTime == 0) {
-                        waveAnimationStartTime = frameTimeNanos;
+                    if (frameTimeNanos + 250_000 >= nextFrameNanos) {
+                        float dt = lastFrameNanos == 0 ? 0 : Math.min(1f / 15f, (frameTimeNanos - lastFrameNanos) * 1e-9f);
+                        lastFrameNanos = frameTimeNanos;
+                        nextFrameNanos = nextFrameNanos == 0 ? frameTimeNanos + 16_666_667L
+                                : Math.max(nextFrameNanos + 16_666_667L, frameTimeNanos + 1_000_000L);
+                        if (fullScreenMode) { surface.advance(dt); waveOffset = surface.wavePhase(); }
+                        else waveOffset = (waveOffset + dt * (float) Math.PI * 1.5f) % ((float) Math.PI * 2);
+                        for (int i = 0; i < bubblePositions.length; i++) {
+                            bubblePositions[i] -= dt * .12f;
+                            if (bubblePositions[i] < 0) bubblePositions[i] += 1;
+                        }
+                        invalidate();
                     }
-                    
-                    // V3.14: 恢复波浪速度，保证流畅度
-                    long elapsedNanos = frameTimeNanos - waveAnimationStartTime;
-                    waveOffset = (float)((elapsedNanos / 1_000_000_000.0) * Math.PI * 1.5); // 0.67秒一个周期
-                    
-                    // 请求重绘（使用postInvalidateOnAnimation确保与vsync同步）
-                    postInvalidateOnAnimation();
                     
                     // V3.6: 修复 - 只在需要时继续下一帧，避免无限递归
                     if (fillLevel > 0) {
@@ -534,7 +504,6 @@ public class LightningShapeView extends View implements SensorEventListener {
         
         // 开始帧回调
         android.view.Choreographer.getInstance().postFrameCallback(frameCallback);
-        Log.d("LightningShapeView", "✓ 波浪动画已启动（Choreographer.FrameCallback，跟随屏幕刷新率）");
     }
     
     /**
@@ -542,22 +511,14 @@ public class LightningShapeView extends View implements SensorEventListener {
      * @param level 0.0 - 1.0
      */
     public void setFillLevel(float level) {
+        if (!Float.isFinite(level)) return;
         this.fillLevel = Math.max(0f, Math.min(1f, level));
-        
-        // 如果开始填充，启动波浪动画（仅启动一次）
-        if (level > 0.01f && frameCallback == null) {
-            startWaveAnimation();
-        }
-        
-        // 如果填充为0，停止动画
-        if (level <= 0 && frameCallback != null) {
-            android.view.Choreographer.getInstance().removeFrameCallback(frameCallback);
-            frameCallback = null;
-        }
+        surface.setFill(fillLevel);
+        updateVisibility(isShown() && getWindowVisibility() == VISIBLE);
         
         // 强制重绘
         invalidate();
-        Log.d("LightningShapeView", "🔋 填充比例已更新: " + (level * 100) + "%");
+
     }
     
     /**
@@ -580,34 +541,12 @@ public class LightningShapeView extends View implements SensorEventListener {
     private void drawFullScreenLiquid(Canvas canvas, int width, int height) {
         if (fillLevel <= 0) return;
         
-        float fillHeight = height * fillLevel;
-        
-        // V3.17: 微小重力倾斜强度，细腻效果
-        float leftTilt = tiltX * 8;  // 左侧倾斜量（微小强度）
-        float rightTilt = -tiltX * 8; // 右侧倾斜量（微小强度）
-        
-        // 1. 复用Path对象，避免每帧创建新对象
+        // Same solid green paint, bottom shadow and six bubbles as the original effect.
+        // Only the fill contour is supplied by the area-conserving surface simulation.
         fullScreenLiquidPath.reset();
-        
-        // 液面波浪 + 重力倾斜
-        float waveY = height - fillHeight;
-        fullScreenLiquidPath.moveTo(0, waveY + leftTilt);
-        
-        // V3.7: 统一波浪计算（避免重复计算）
-        updateWavePoints(width, waveOffset);
-        
-        // V3.14: 恢复波浪点数，保证流畅度
-        int pointCount = Math.min(width / 6, wavePoints.length);  // 恢复密集波浪点
-        for (int i = 0; i < pointCount; i++) {
-            float x = (float) i / (pointCount - 1) * width;
-            float wave = wavePoints[i];
-            float tilt = leftTilt + (rightTilt - leftTilt) * (x / (float)width);
-            fullScreenLiquidPath.lineTo(x, waveY + wave + tilt);
-        }
-        
-        // 连接到右下角，再到左下角，形成封闭路径
-        fullScreenLiquidPath.lineTo(width, height);
-        fullScreenLiquidPath.lineTo(0, height);
+        if (surface.count() == 0) return;
+        fullScreenLiquidPath.moveTo(surface.x[0], surface.y[0]);
+        for (int i = 1; i < surface.count(); i++) fullScreenLiquidPath.lineTo(surface.x[i], surface.y[i]);
         fullScreenLiquidPath.close();
         
         // 2. 绘制整体液体
@@ -626,8 +565,14 @@ public class LightningShapeView extends View implements SensorEventListener {
         canvas.drawPath(fullScreenLiquidPath, fullScreenShadowPaint);
         
         // V3.15: 修复气泡闪烁，每帧都绘制
-        if (fillHeight > 10) {  // 降低条件，让气泡在任何液体高度都能显示
-            drawBubbles(canvas, width, height, fillHeight);
+        if (height * fillLevel > 10) {
+            canvas.save();
+            canvas.clipPath(fullScreenLiquidPath);
+            for (int i = 0; i < bubblePositions.length; i++) {
+                surface.bubble(BUBBLE_X[i], bubblePositions[i], bubblePoint);
+                canvas.drawCircle(bubblePoint[0], bubblePoint[1], BUBBLE_RADIUS[i], bubblePaint);
+            }
+            canvas.restore();
         }
     }
     
@@ -641,32 +586,91 @@ public class LightningShapeView extends View implements SensorEventListener {
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
-        // V3.5: 注册重力传感器（使用UI延迟，降低回调频率）
-        if (sensorManager != null && accelerometer != null) {
-            sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_UI);
-            Log.d("LightningShapeView", "✅ 重力传感器已注册（UI延迟）");
+        updateSensorRotation();
+        updateVisibility(isShown() && getWindowVisibility() == VISIBLE);
+    }
+
+    @Override
+    public void onVisibilityAggregated(boolean isVisible) {
+        super.onVisibilityAggregated(isVisible);
+        updateVisibility(isVisible);
+    }
+
+    @Override
+    protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility);
+        updateVisibility(visibility == VISIBLE && isShown());
+    }
+
+    private void updateVisibility(boolean visible) {
+        visibleToUser = visible && hostResumed && !released && fillLevel > 0 && isAttachedToWindow();
+        if (visibleToUser) {
+            if (!sensorAttempted && sensorManager != null && accelerometer != null) {
+                sensorAttempted = true;
+                sensorStartNanos = android.os.SystemClock.elapsedRealtimeNanos();
+                activeSensorListener = new SensorEventListener() {
+                    @Override public void onSensorChanged(SensorEvent event) {
+                        if (activeSensorListener == this && visibleToUser && event.timestamp >= sensorStartNanos)
+                            LightningShapeView.this.onSensorChanged(event);
+                    }
+                    @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }
+                };
+                try {
+                    sensorRegistered = sensorManager.registerListener(activeSensorListener, accelerometer,
+                            20_000, new android.os.Handler(android.os.Looper.getMainLooper()));
+                } catch (RuntimeException e) {
+                    Log.w("LightningShapeView", "Cannot register gravity sensor", e);
+                }
+            }
+            if (fillLevel > 0) startWaveAnimation();
+        } else {
+            if (sensorRegistered && sensorManager != null) sensorManager.unregisterListener(activeSensorListener);
+            activeSensorListener = null;
+            sensorRegistered = false;
+            sensorAttempted = false;
+            if (frameCallback != null) {
+                android.view.Choreographer.getInstance().removeFrameCallback(frameCallback);
+                frameCallback = null;
+            }
+            lastFrameNanos = nextFrameNanos = 0;
+            surface.resetClock();
         }
     }
-    
+
+    public void setHostResumed(boolean resumed) {
+        hostResumed = resumed;
+        updateVisibility(isShown() && getWindowVisibility() == VISIBLE);
+    }
+
+    public void release() { released = true; updateVisibility(false); }
+
+    @Override protected void onConfigurationChanged(android.content.res.Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        updateSensorRotation();
+    }
+
+    private void updateSensorRotation() {
+        android.view.Display display = getDisplay();
+        displayRotation = display == null ? 0 : display.getRotation();
+        rearFacing = display != null && display.getDisplayId() != 0;
+    }
+
     @Override
     protected void onDetachedFromWindow() {
+        updateVisibility(false);
         super.onDetachedFromWindow();
-        // 注销重力传感器
-        if (sensorManager != null) {
-            sensorManager.unregisterListener(this);
-            Log.d("LightningShapeView", "❌ 重力传感器已注销");
-        }
-        
-        // V3.5: 停止Choreographer回调
-        if (frameCallback != null) {
-            android.view.Choreographer.getInstance().removeFrameCallback(frameCallback);
-            frameCallback = null;
-        }
     }
-    
+
     @Override
     public void onSensorChanged(SensorEvent event) {
         if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+            if (fullScreenMode) {
+                // Specific force -> apparent acceleration, then rear display -> Canvas Y down.
+                LiquidMotion.map(-event.values[0], -event.values[1], -event.values[2],
+                        displayRotation, rearFacing, mappedMotion);
+                surface.setGravity(mappedMotion[0], -mappedMotion[1]);
+                return;
+            }
             // 获取重力加速度（X和Y轴）
             float x = event.values[0]; // 左右倾斜（-10 到 10）
             float y = event.values[1]; // 前后倾斜（-10 到 10）

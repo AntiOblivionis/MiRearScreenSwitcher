@@ -17,7 +17,8 @@
     <!-- 通知权限 (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- 查询所有应用包权限 (Android 11+，用于通知功能选择应用) -->
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+    <!-- The notification allowlist must include installed apps without launcher activities. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission"/>
     
     <application
         android:label="MRSS"
@@ -79,19 +80,7 @@
             </intent-filter>
         </service>
         
-        <!-- 监听背屏状态和系统屏幕状态广播接收器 -->
-        <receiver
-            android:name=".RearScreenBroadcastReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="miui.intent.action.SUB_SCREEN_ON"/>
-                <action android:name="miui.intent.action.SUB_SCREEN_OFF"/>
-                <action android:name="android.intent.action.SCREEN_ON"/>
-                <action android:name="android.intent.action.SCREEN_OFF"/>
-            </intent-filter>
-        </receiver>
-        
-        <!-- 前台Service - 背屏漫游服务 -->
+<!-- 前台Service - 背屏漫游服务 -->
         <service
             android:name=".RearScreenKeeperService"
             android:enabled="true"
@@ -190,7 +179,6 @@
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode|smallestScreenSize|density"
             android:directBootAware="true"
             android:showWhenLocked="true"
-            android:turnScreenOn="true"
             android:hardwareAccelerated="true">
             <meta-data android:name="miui.rear.policy" android:value="miui"/>
         </activity>
@@ -205,8 +193,7 @@
             android:theme="@style/Theme.Transparent"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode|smallestScreenSize|density"
             android:directBootAware="true"
-            android:showWhenLocked="true"
-            android:turnScreenOn="true">
+            android:showWhenLocked="true">
             <meta-data android:name="miui.rear.policy" android:value="miui"/>
         </activity>
             

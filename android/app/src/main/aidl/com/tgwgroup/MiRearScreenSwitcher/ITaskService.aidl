@@ -1,5 +1,9 @@
 package com.tgwgroup.MiRearScreenSwitcher;
 
+import com.tgwgroup.MiRearScreenSwitcher.ITaskObserver;
+import com.tgwgroup.MiRearScreenSwitcher.IRecordingObserver;
+import android.os.Bundle;
+
 interface ITaskService {
     void destroy() = 16777114;  // Shizuku required
     
@@ -132,5 +136,14 @@ interface ITaskService {
      */
     boolean executeShellCommand(String cmd) = 20;
     String executeShellCommandWithResult(String cmd) = 21;
+    boolean registerTaskObserver(ITaskObserver observer) = 22;
+    void unregisterTaskObserver(ITaskObserver observer) = 23;
+    boolean wakeDisplay(int displayId) = 24;
+    String getRearPhysicalDisplayId() = 25;
+    String startRearRecording(IRecordingObserver observer) = 26;
+    boolean stopRearRecording(String path) = 27;
+    boolean launchRearActivity(String component, in Bundle extras) = 28;
+    boolean setRearScreenWakeLock(IBinder owner, boolean enabled) = 29;
+    int getRearInteractiveState() = 30;
 }
 

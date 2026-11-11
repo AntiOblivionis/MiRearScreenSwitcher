@@ -29,10 +29,38 @@ public class DisplayInfoCache {
     private static volatile DisplayInfoCache instance;
     
     // 缓存的背屏信息
-    private RearDisplayHelper.RearDisplayInfo cachedInfo;
-    private boolean initialized = false;
+    private volatile RearDisplayHelper.RearDisplayInfo cachedInfo;
+    private volatile boolean initialized = false;
+    private final java.util.concurrent.atomic.AtomicBoolean loading = new java.util.concurrent.atomic.AtomicBoolean();
+
+    public void initializeAsync(ITaskService service) {
+        if (initialized || !loading.compareAndSet(false, true)) return;
+        new Thread(() -> {
+            try { initialize(service); } finally { loading.set(false); }
+        }, "MRSS-display-info").start();
+    }
     
     private DisplayInfoCache() {}
+
+    /** Public display APIs reflect current DPI/rotation without a shell query or a stale default. */
+    public RearDisplayHelper.RearDisplayInfo getCachedInfo(android.content.Context context) {
+        android.hardware.display.DisplayManager manager = context.getSystemService(android.hardware.display.DisplayManager.class);
+        android.view.Display display = manager == null ? null : manager.getDisplay(1);
+        if (display == null) return getCachedInfo();
+        android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
+        display.getRealMetrics(metrics);
+        RearDisplayHelper.RearDisplayInfo info = new RearDisplayHelper.RearDisplayInfo();
+        info.width = metrics.widthPixels;
+        info.height = metrics.heightPixels;
+        info.densityDpi = metrics.densityDpi;
+        info.verified = info.width > 0 && info.height > 0 && info.densityDpi > 0;
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            android.view.DisplayCutout cutout = display.getCutout();
+            if (cutout != null) info.cutout = new Rect(cutout.getSafeInsetLeft(), cutout.getSafeInsetTop(),
+                    cutout.getSafeInsetRight(), cutout.getSafeInsetBottom());
+        }
+        return info;
+    }
     
     public static DisplayInfoCache getInstance() {
         if (instance == null) {
@@ -57,7 +85,7 @@ public class DisplayInfoCache {
         try {
             Log.d(TAG, "🔄 开始获取背屏信息...");
             cachedInfo = RearDisplayHelper.getRearDisplayInfo(taskService);
-            initialized = true;
+            initialized = cachedInfo.verified;
             
             Log.d(TAG, String.format("✅ 背屏信息已缓存: %dx%d, DPI=%d, Cutout=%s",
                 cachedInfo.width, cachedInfo.height, cachedInfo.densityDpi,
@@ -71,7 +99,7 @@ public class DisplayInfoCache {
             cachedInfo.height = 572;
             cachedInfo.densityDpi = 450;
             cachedInfo.cutout = new Rect(0, 0, 0, 0);
-            initialized = true;
+            initialized = false;
             Log.w(TAG, "⚠️ 使用默认背屏信息");
         }
     }
@@ -89,7 +117,8 @@ public class DisplayInfoCache {
             defaultInfo.cutout = new Rect(0, 0, 0, 0);
             return defaultInfo;
         }
-        return cachedInfo;
+        RearDisplayHelper.RearDisplayInfo value = cachedInfo;
+        return value != null ? value : new RearDisplayHelper.RearDisplayInfo();
     }
     
     /**

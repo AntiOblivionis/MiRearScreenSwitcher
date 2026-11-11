@@ -36,6 +36,9 @@ import io.flutter.plugin.common.MethodChannel;
 import rikka.shizuku.Shizuku;
 
 public class MainActivity extends FlutterActivity {
+    private volatile boolean destroyed;
+    private final java.util.concurrent.ExecutorService nativeCommands = java.util.concurrent.Executors.newSingleThreadExecutor();
+
     private static final String CHANNEL = "com.display.switcher/task";
     private static final String TAG = "MainActivity";
     private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 1001;
@@ -47,7 +50,8 @@ public class MainActivity extends FlutterActivity {
         return currentInstance;
     }
     
-    private ITaskService taskService;
+    private volatile ITaskService taskService;
+    private volatile java.util.concurrent.CountDownLatch serviceReady = new java.util.concurrent.CountDownLatch(1);
     private MethodChannel methodChannel;
     private final Shizuku.UserServiceArgs serviceArgs = 
         new Shizuku.UserServiceArgs(new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -73,24 +77,13 @@ public class MainActivity extends FlutterActivity {
     /**
      * TaskService重连任务
      */
-    private final Runnable reconnectTaskServiceRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (taskService == null) {
-                bindTaskService();
-                
-                // 如果重连失败，2秒后再次尝试
-                new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(this, 30);
-            } else {
-            }
-        }
-    };
+
     
     /**
      * 安排TaskService重连
      */
     private void scheduleReconnectTaskService() {
-        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(reconnectTaskServiceRunnable, 30);
+        // Shared client handles Binder/permission events and bounded backoff.
     };
     
     private final Shizuku.OnRequestPermissionResultListener requestPermissionResultListener = 
@@ -111,33 +104,18 @@ public class MainActivity extends FlutterActivity {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
             taskService = ITaskService.Stub.asInterface(binder);
+            serviceReady.countDown();
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
+            serviceReady = new java.util.concurrent.CountDownLatch(1);
             taskService = null;
         }
     };
     
     private void bindTaskService() {
-        if (taskService != null) {
-            return;
-        }
-        
-        try {
-            if (!Shizuku.pingBinder()) {
-                Log.e(TAG, "Shizuku not available");
-                return;
-            }
-            
-            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                Log.e(TAG, "No Shizuku permission");
-                return;
-            }
-            Shizuku.bindUserService(serviceArgs, taskServiceConnection);
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to bind TaskService", e);
-        }
+        if (!destroyed) TaskServiceClient.bind(null, taskServiceConnection);
     }
     
     @Override
@@ -189,73 +167,22 @@ public class MainActivity extends FlutterActivity {
      * 在背屏启动通知显示Activity
      */
     private void startNotificationOnRearScreen(String packageName, String title, String text, long when) {
-        if (taskService == null) {
-            Log.w(TAG, "TaskService not available for notification");
-            return;
-        }
-        
-        new Thread(() -> {
+        RearAnimationManager.startAnimation(RearAnimationManager.AnimationType.NOTIFICATION);
+        final long session = RearAnimationManager.getGeneration();
+        RearAnimationManager.LAUNCHES.execute(() -> {
+            boolean launched = false;
             try {
-                // 步骤1: 禁用官方Launcher
-                taskService.disableSubScreenLauncher();
-                
-                // 步骤2: 唤醒背屏
-                taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
-                Thread.sleep(50);
-                
-                // 步骤3: 在主屏启动Activity
-                String componentName = getPackageName() + "/" + RearScreenNotificationActivity.class.getName();
-                String mainCmd = String.format(
-                    "am start -n %s --es packageName \"%s\" --es title \"%s\" --es text \"%s\" --el when %d",
-                    componentName, packageName,
-                    title != null ? title.replace("\"", "'") : "",
-                    text != null ? text.replace("\"", "'") : "",
-                    when
-                );
-                taskService.executeShellCommand(mainCmd);
-                
-                // 步骤4: 轮询获取taskId
-                String notifTaskId = null;
-                int attempts = 0;
-                int maxAttempts = 20;
-                
-                while (notifTaskId == null && attempts < maxAttempts) {
-                    Thread.sleep(30);
-                    String result = taskService.executeShellCommandWithResult("am stack list | grep RearScreenNotificationActivity");
-                    if (result != null && !result.trim().isEmpty()) {
-                        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("taskId=(\\d+)");
-                        java.util.regex.Matcher matcher = pattern.matcher(result);
-                        if (matcher.find()) {
-                            notifTaskId = matcher.group(1);
-                            Log.d(TAG, "Found notification taskId=" + notifTaskId);
-                            break;
-                        }
-                    }
-                    attempts++;
-                }
-                
-                if (notifTaskId != null) {
-                    // 步骤5: 移动到背屏
-                    String moveCmd = "service call activity_task 50 i32 " + notifTaskId + " i32 1";
-                    taskService.executeShellCommand(moveCmd);
-                    Thread.sleep(40);
-                    
-                    // 步骤6: 检查是否锁屏，决定是否关闭主屏
-                    android.app.KeyguardManager km = (android.app.KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
-                    if (km != null && km.isKeyguardLocked()) {
-                        // 主屏休眠功能已移除
-                        Log.d(TAG, "🔒 锁屏状态，主屏已关闭");
-                    }
-                    
-                    Log.d(TAG, "✅ Notification animation started on rear screen");
-                } else {
-                    Log.e(TAG, "❌ Failed to find notification taskId");
-                }
-                
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to show notification on rear screen", e);
-            }
-        }).start();
+                if (destroyed || taskService == null || !RearAnimationManager.isCurrent(RearAnimationManager.AnimationType.NOTIFICATION, session)) return;
+                android.os.Bundle extras = new android.os.Bundle();
+                extras.putString("packageName", packageName == null ? getPackageName() : packageName);
+                extras.putString("title", title == null ? "" : title);
+                extras.putString("text", text == null ? "" : text);
+                extras.putLong("when", when);
+                extras.putLong("animationSession", session);
+                launched = taskService.launchRearActivity(getPackageName() + "/" + RearScreenNotificationActivity.class.getName(), extras);
+            } catch (Exception e) { Log.w(TAG, "Rear notification failed", e); }
+            finally { if (!launched) RearAnimationManager.endAnimation(RearAnimationManager.AnimationType.NOTIFICATION, session); }
+        });
     }
     
     /**
@@ -288,10 +215,15 @@ public class MainActivity extends FlutterActivity {
     
     @Override
     protected void onDestroy() {
+        destroyed = true;
+        serviceReady.countDown();
+        nativeCommands.shutdown();
+        TaskServiceClient.unbind(null, taskServiceConnection, false);
+
         super.onDestroy();
         
         // 清除静态实例
-        currentInstance = null;
+        if (currentInstance == this) currentInstance = null;
         
         Shizuku.removeBinderReceivedListener(binderReceivedListener);
         Shizuku.removeBinderDeadListener(binderDeadListener);
@@ -304,6 +236,8 @@ public class MainActivity extends FlutterActivity {
         
         methodChannel = new MethodChannel(flutterEngine.getDartExecutor().getBinaryMessenger(), CHANNEL);
         methodChannel.setMethodCallHandler((call, result) -> {
+            Runnable operation = () -> {
+                if (destroyed) { result.error("CLOSED", "Activity closed", null); return; }
                 switch (call.method) {
                     case "checkShizuku": {
                         try {
@@ -502,10 +436,14 @@ public class MainActivity extends FlutterActivity {
                         // 确保TaskService连接正常
                         try {
                             if (taskService == null) {
-                                // 尝试重新绑定
+                                java.util.concurrent.CountDownLatch ready = serviceReady;
                                 bindTaskService();
+                                ready.await(3, java.util.concurrent.TimeUnit.SECONDS);
                             }
-                            result.success(taskService != null);
+                            result.success(!destroyed && taskService != null && taskService.asBinder().isBinderAlive());
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            result.error("CANCELLED", "Connection wait interrupted", null);
                         } catch (Exception e) {
                             Log.e(TAG, "Failed to ensure TaskService connection", e);
                             result.error("ERROR", e.getMessage(), null);
@@ -545,45 +483,28 @@ public class MainActivity extends FlutterActivity {
                     }
                     
                     case "returnRearAppAndRestart": {
-                        // 重启前先拉回背屏应用
-                        if (taskService != null) {
-                            try {
-                                // 获取最后移动的任务信息
-                                String lastTask = SwitchToRearTileService.getLastMovedTask();
-                                
-                                if (lastTask != null && lastTask.contains(":")) {
-                                    String[] parts = lastTask.split(":");
-                                    int taskId = Integer.parseInt(parts[1]);
-                                    
-                                    // 检查任务是否还在背屏
-                                    boolean onRear = taskService.isTaskOnDisplay(taskId, 1);
-                                    
-                                    if (onRear) {
-                                        // 拉回主屏
-                                        taskService.moveTaskToDisplay(taskId, 0);
-                                        
-                                        // 恢复官方Launcher
-                                        taskService.enableSubScreenLauncher();
-                                        
-                                        result.success(true);
-                                    } else {
-                                        // 没有应用在背屏
-                                        result.success(false);
-                                    }
-                                } else {
-                                    // 没有记录
-                                    result.success(false);
+                        ITaskService service = taskService;
+                        if (service == null) { result.error("NOT_CONNECTED", "TaskService unavailable", null); break; }
+                        try {
+                            String owned = getSharedPreferences("mrss_keeper", MODE_PRIVATE).getString("task", null);
+                            if (owned == null) owned = SwitchToRearTileService.getLastMovedTask();
+                            String foreground = service.getForegroundAppOnDisplay(1);
+                            if (owned == null || !owned.equals(foreground)) {
+                                result.success(true); // No currently owned foreground task to return.
+                            } else {
+                                int id = Integer.parseInt(owned.substring(owned.lastIndexOf(':') + 1));
+                                boolean moved = service.moveTaskToDisplay(id, 0);
+                                if (moved) {
+                                    getSharedPreferences("mrss_keeper", MODE_PRIVATE).edit().remove("task").apply();
+                                    stopService(new Intent(this, RearScreenKeeperService.class));
+                                    service.enableSubScreenLauncher();
                                 }
-                            } catch (Exception e) {
-                                Log.e(TAG, "Failed to return rear app", e);
-                                result.error("ERROR", e.getMessage(), null);
+                                result.success(moved);
                             }
-                        } else {
-                            result.error("ERROR", "TaskService not available", null);
-                        }
+                        } catch (Exception e) { result.error("RETURN_FAILED", e.getMessage(), null); }
                         break;
                     }
-                    
+
                     case "setProximitySensorEnabled": {
                         // V2.2: 设置接近传感器开关
                         boolean enabled = (boolean) call.argument("enabled");
@@ -640,7 +561,7 @@ public class MainActivity extends FlutterActivity {
                         prefs.edit().putBoolean("charging_always_on_enabled", enabled).apply();
                         
                         // 通知ChargingService重新加载设置
-                        sendBroadcast(new Intent("com.tgwgroup.MiRearScreenSwitcher.RELOAD_CHARGING_SETTINGS"));
+                        sendBroadcast(new Intent("com.tgwgroup.MiRearScreenSwitcher.RELOAD_CHARGING_SETTINGS").setPackage(getPackageName()));
                         
                         Log.d(TAG, "Charging always on set to: " + enabled);
                         result.success(true);
@@ -804,7 +725,7 @@ public class MainActivity extends FlutterActivity {
                                 .apply();
                             
                             // 通知NotificationService重新加载设置
-                            sendBroadcast(new Intent("com.tgwgroup.MiRearScreenSwitcher.RELOAD_NOTIFICATION_SETTINGS"));
+                            sendBroadcast(new Intent("com.tgwgroup.MiRearScreenSwitcher.RELOAD_NOTIFICATION_SETTINGS").setPackage(getPackageName()));
                             
                             Log.d(TAG, "Privacy hide title set to: " + enabled);
                             result.success(true);
@@ -825,7 +746,7 @@ public class MainActivity extends FlutterActivity {
                                 .apply();
                             
                             // 通知NotificationService重新加载设置
-                            sendBroadcast(new Intent("com.tgwgroup.MiRearScreenSwitcher.RELOAD_NOTIFICATION_SETTINGS"));
+                            sendBroadcast(new Intent("com.tgwgroup.MiRearScreenSwitcher.RELOAD_NOTIFICATION_SETTINGS").setPackage(getPackageName()));
                             
                             Log.d(TAG, "Privacy hide content set to: " + enabled);
                             result.success(true);
@@ -907,7 +828,17 @@ public class MainActivity extends FlutterActivity {
                     default:
                         result.notImplemented();
                 }
-            });
+                };
+            switch (call.method) {
+                case "getCurrentApp": case "getCurrentRearDpi": case "setRearDpi":
+                case "resetRearDpi": case "setDisplayRotation": case "getDisplayRotation":
+                case "ensureTaskServiceConnected": case "returnRearAppAndRestart":
+                    if (destroyed) result.error("CLOSED", "Activity closed", null);
+                    else nativeCommands.execute(operation);
+                    break;
+                default: operation.run();
+            }
+        });
     }
     
     @Override
@@ -996,7 +927,8 @@ public class MainActivity extends FlutterActivity {
                     Drawable icon = pm.getApplicationIcon(appInfo);
                     // 使用原始图标尺寸，不限制大小
                     int iconSize = Math.max(icon.getIntrinsicWidth(), icon.getIntrinsicHeight());
-                    if (iconSize <= 0) iconSize = 192; // 如果无法获取，使用默认高分辨率
+                    if (iconSize <= 0) iconSize = 96;
+                    iconSize = Math.min(iconSize, 96); // 如果无法获取，使用默认高分辨率
                     
                     android.graphics.Bitmap bitmap = android.graphics.Bitmap.createBitmap(
                         iconSize, iconSize, android.graphics.Bitmap.Config.ARGB_8888

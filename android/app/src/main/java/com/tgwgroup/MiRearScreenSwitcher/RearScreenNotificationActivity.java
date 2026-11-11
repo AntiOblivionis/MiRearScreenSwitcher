@@ -30,6 +30,17 @@ import android.widget.TextView;
  * 显示应用图标、名称和通知内容，带非线性动画效果
  */
 public class RearScreenNotificationActivity extends Activity {
+    private long animationSession;
+
+    @Override protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        if (!RearAnimationManager.isCurrent(RearAnimationManager.AnimationType.NOTIFICATION, intent.getLongExtra("animationSession", -1))) return;
+        if (intent.getLongExtra("animationSession", -1) != animationSession) {
+            setIntent(intent);
+            recreate();
+        }
+    }
+
     private static final String TAG = "RearScreenNotificationActivity";
     
     // 静态实例追踪
@@ -48,6 +59,7 @@ public class RearScreenNotificationActivity extends Activity {
         @Override
         public void onReceive(android.content.Context context, android.content.Intent intent) {
             if ("com.tgwgroup.MiRearScreenSwitcher.INTERRUPT_NOTIFICATION_ANIMATION".equals(intent.getAction())) {
+                if (RearAnimationManager.isCurrent(RearAnimationManager.AnimationType.NOTIFICATION, animationSession)) return;
                 Log.d(TAG, "🔄 收到打断广播（新动画来了），立即销毁但不恢复Launcher");
                 finish();
             }
@@ -66,12 +78,12 @@ public class RearScreenNotificationActivity extends Activity {
         Log.d(TAG, String.format("[%tT.%tL] 🟡 onCreate开始", onCreateStartTime, onCreateStartTime));
         
         super.onCreate(savedInstanceState);
+        animationSession = getIntent().getLongExtra("animationSession", -1);
+        if (!RearAnimationManager.isCurrent(RearAnimationManager.AnimationType.NOTIFICATION, animationSession)) { finish(); return; }
+        currentInstance = this;
         
         // 判断当前所在的屏幕
-        int displayId = 0;
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-            displayId = getDisplay().getDisplayId();
-        }
+        int displayId = getWindowManager().getDefaultDisplay().getDisplayId();
         Log.d(TAG, String.format("[%tT.%tL] 📍 当前displayId=%d", onCreateStartTime, onCreateStartTime, displayId));
         
         // 获取Intent数据
@@ -94,8 +106,8 @@ public class RearScreenNotificationActivity extends Activity {
             applyRegularLayout();
         }
         
-        // V3.2: 保持常亮 + 锁屏显示
-        getWindow().addFlags(
+        // Apply the bright flag only to the rear window.
+        if (displayId == 1) getWindow().addFlags(
             android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON |
             android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
         );
@@ -121,11 +133,7 @@ public class RearScreenNotificationActivity extends Activity {
             
             // 注册广播接收器（即使是占位符也要注册）
             android.content.IntentFilter interruptFilter = new android.content.IntentFilter("com.tgwgroup.MiRearScreenSwitcher.INTERRUPT_NOTIFICATION_ANIMATION");
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(interruptReceiver, interruptFilter, android.content.Context.RECEIVER_NOT_EXPORTED);
-            } else {
-                registerReceiver(interruptReceiver, interruptFilter);
-            }
+            androidx.core.content.ContextCompat.registerReceiver(this, interruptReceiver, interruptFilter, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
             currentInstance = this;
             return;
         }
@@ -199,98 +207,7 @@ public class RearScreenNotificationActivity extends Activity {
         startNotificationAnimation(appIconCenter, appNameContainer, contentContainer);
         
         // 点击跳转到应用（优先在背屏启动）
-        container.setOnClickListener(v -> {
-            long clickTime = System.currentTimeMillis();
-            Log.d(TAG, String.format("[%tT.%tL] 👆 收到点击，准备跳转 package=%s", clickTime, clickTime, packageName));
-            try {
-                Intent launchIntent = getPackageManager().getLaunchIntentForPackage(packageName);
-                Log.d(TAG, String.format("[%tT.%tL] 🔍 getLaunchIntentForPackage -> %s", clickTime, clickTime, (launchIntent == null ? "null" : String.valueOf(launchIntent.getComponent()))));
-                if (launchIntent == null) {
-                    Log.w(TAG, String.format("[%tT.%tL] ⚠️ 无法获取启动Intent: %s", clickTime, clickTime, packageName));
-                    finish();
-                    return;
-                }
-                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-
-                boolean started = false;
-                // 尝试直接在主屏启动（ActivityOptions -> display=0）
-                try {
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                        android.app.ActivityOptions opts = android.app.ActivityOptions.makeBasic();
-                        // setLaunchDisplayId 在部分ROM可用；若不可用将抛异常，进入fallback
-                        java.lang.reflect.Method m = android.app.ActivityOptions.class.getMethod("setLaunchDisplayId", int.class);
-                        m.invoke(opts, 0);
-                        Log.d(TAG, String.format("[%tT.%tL] 🚀 尝试ActivityOptions在display=0(主屏)启动", clickTime, clickTime));
-                        // 点亮主屏
-                        try {
-                            ITaskService tsWake = NotificationService.getTaskService();
-                            if (tsWake != null) {
-                                tsWake.executeShellCommand("// 主屏唤醒功能已移除");
-                                Log.d(TAG, String.format("[%tT.%tL] ✓ 已唤醒主屏", clickTime, clickTime));
-                            }
-                        } catch (Throwable ignored) {}
-                        startActivity(launchIntent, opts.toBundle());
-                        started = true;
-                        Log.d(TAG, String.format("[%tT.%tL] ✓ ActivityOptions主屏启动成功", clickTime, clickTime));
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, String.format("[%tT.%tL] 🔁 ActivityOptions不可用，转fallback: %s", clickTime, clickTime, t.getMessage()));
-                }
-
-                if (!started) {
-                    // 回退：使用shell在主屏启动
-                    try {
-                        String component = null;
-                        if (launchIntent.getComponent() != null) {
-                            component = launchIntent.getComponent().flattenToShortString();
-                        }
-                        if (component == null) {
-                            // 解析默认LAUNCHER Activity
-                            android.content.pm.PackageManager pm = getPackageManager();
-                            Intent resolve = new Intent(Intent.ACTION_MAIN);
-                            resolve.addCategory(Intent.CATEGORY_LAUNCHER);
-                            resolve.setPackage(packageName);
-                            android.content.pm.ResolveInfo ri = pm.resolveActivity(resolve, 0);
-                            if (ri != null && ri.activityInfo != null) {
-                                component = ri.activityInfo.packageName + "/" + ri.activityInfo.name;
-                            }
-                        }
-                        Log.d(TAG, String.format("[%tT.%tL] 🧭 解析到组件: %s", clickTime, clickTime, String.valueOf(component)));
-                        if (component != null) {
-                            ITaskService ts = NotificationService.getTaskService();
-                            if (ts != null) {
-                                // 先唤醒主屏
-                                try {
-                                    ts.executeShellCommand("// 主屏唤醒功能已移除");
-                                    Log.d(TAG, String.format("[%tT.%tL] ✓ 已唤醒主屏", clickTime, clickTime));
-                                } catch (Throwable ignored) {}
-                                String cmd = "am start --display 0 -n " + component;
-                                boolean ok = ts.executeShellCommand(cmd);
-                                if (!ok) {
-                                    // 有些ROM不支持 --display 0，退化为默认显示
-                                    cmd = "am start -n " + component;
-                                    ok = ts.executeShellCommand(cmd);
-                                    Log.d(TAG, String.format("[%tT.%tL] 🔁 改为默认显示启动，结果=%s", clickTime, clickTime, ok));
-                                }
-                                Log.d(TAG, String.format("[%tT.%tL] ✓ Fallback shell主屏启动%s 组件=%s", clickTime, clickTime, ok ? "成功" : "失败", component));
-                                started = ok;
-                            } else {
-                                Log.w(TAG, String.format("[%tT.%tL] ⚠️ TaskService为空，无法shell启动", clickTime, clickTime));
-                            }
-                        }
-                    } catch (Throwable t) {
-                        Log.w(TAG, String.format("[%tT.%tL] Fallback shell start 异常: %s", clickTime, clickTime, t.getMessage()));
-                    }
-                }
-
-                Log.d(TAG, String.format("[%tT.%tL] 🧹 结束通知Activity，started=%s", clickTime, clickTime, started));
-                // 无论如何结束当前通知Activity
-                finish();
-            } catch (Exception e) {
-                Log.e(TAG, String.format("[%tT.%tL] ❌ 启动失败: %s", clickTime, clickTime, e.getMessage()), e);
-                finish();
-            }
-        });
+        container.setOnClickListener(v -> openNotificationApp());
         
         // V3.4: 根据设置的时间自动关闭
         int duration = getSharedPreferences("mrss_settings", MODE_PRIVATE).getInt("notification_duration", 10);
@@ -302,11 +219,7 @@ public class RearScreenNotificationActivity extends Activity {
         
         // 注册广播接收器（监听打断事件）
         android.content.IntentFilter interruptFilter = new android.content.IntentFilter("com.tgwgroup.MiRearScreenSwitcher.INTERRUPT_NOTIFICATION_ANIMATION");
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(interruptReceiver, interruptFilter, android.content.Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(interruptReceiver, interruptFilter);
-        }
+        androidx.core.content.ContextCompat.registerReceiver(this, interruptReceiver, interruptFilter, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
         Log.d(TAG, String.format("[%tT.%tL] ✓ 已注册通知动画广播接收器", onCreateEndTime, onCreateEndTime));
         
         // 设置为当前实例
@@ -394,6 +307,11 @@ public class RearScreenNotificationActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        initializeAfterMove();
+    }
+
+    private void initializeAfterMove() {
+        if (getWindowManager().getDefaultDisplay().getDisplayId() != 1 || isFinishing()) return;
         long resumeTime = System.currentTimeMillis();
         Log.d(TAG, String.format("[%tT.%tL] 🟢 onResume", resumeTime, resumeTime));
         
@@ -414,8 +332,8 @@ public class RearScreenNotificationActivity extends Activity {
         }
         
         // 检查是否已从主屏移动到背屏（占位符变为实际显示）
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-            int currentDisplayId = getDisplay() != null ? getDisplay().getDisplayId() : 0;
+        {
+            int currentDisplayId = getWindowManager().getDefaultDisplay().getDisplayId();
             View container = findViewById(R.id.notification_container);
             
             Log.d(TAG, String.format("[%tT.%tL] 🔍 检查移动: displayId=%d, contentInitialized=%s, container=%s", 
@@ -496,95 +414,7 @@ public class RearScreenNotificationActivity extends Activity {
                 startNotificationAnimation(appIconCenter, appNameContainer, contentContainer);
                 
                 // 设置点击事件和自动关闭
-                container.setOnClickListener(v -> {
-                    long clickTime = System.currentTimeMillis();
-                    Log.d(TAG, String.format("[%tT.%tL] 👆 收到点击，准备跳转 package=%s", clickTime, clickTime, packageName));
-                    try {
-                        Intent launchIntent = getPackageManager().getLaunchIntentForPackage(packageName);
-                        Log.d(TAG, String.format("[%tT.%tL] 🔍 getLaunchIntentForPackage -> %s", clickTime, clickTime, (launchIntent == null ? "null" : String.valueOf(launchIntent.getComponent()))));
-                        if (launchIntent == null) {
-                            Log.w(TAG, String.format("[%tT.%tL] ⚠️ 无法获取启动Intent: %s", clickTime, clickTime, packageName));
-                            finish();
-                            return;
-                        }
-                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-
-                        boolean started = false;
-                        // 尝试直接在主屏启动（ActivityOptions -> display=0）
-                        try {
-                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                                android.app.ActivityOptions opts = android.app.ActivityOptions.makeBasic();
-                                java.lang.reflect.Method m = android.app.ActivityOptions.class.getMethod("setLaunchDisplayId", int.class);
-                                m.invoke(opts, 0);
-                                Log.d(TAG, String.format("[%tT.%tL] 🚀 尝试ActivityOptions在display=0(主屏)启动", clickTime, clickTime));
-                                // 点亮主屏
-                                try {
-                                    ITaskService tsWake = NotificationService.getTaskService();
-                                    if (tsWake != null) {
-                                        tsWake.executeShellCommand("// 主屏唤醒功能已移除");
-                                        Log.d(TAG, String.format("[%tT.%tL] ✓ 已唤醒主屏", clickTime, clickTime));
-                                    }
-                                } catch (Throwable ignored) {}
-                                startActivity(launchIntent, opts.toBundle());
-                                started = true;
-                                Log.d(TAG, String.format("[%tT.%tL] ✓ ActivityOptions主屏启动成功", clickTime, clickTime));
-                            }
-                        } catch (Throwable t) {
-                            Log.w(TAG, String.format("[%tT.%tL] 🔁 ActivityOptions不可用，转fallback: %s", clickTime, clickTime, t.getMessage()));
-                        }
-
-                        if (!started) {
-                            // 回退：使用shell在主屏启动
-                            try {
-                                String component = null;
-                                if (launchIntent.getComponent() != null) {
-                                    component = launchIntent.getComponent().flattenToShortString();
-                                }
-                                if (component == null) {
-                                    // 解析默认LAUNCHER Activity
-                                    android.content.pm.PackageManager pm = getPackageManager();
-                                    Intent resolve = new Intent(Intent.ACTION_MAIN);
-                                    resolve.addCategory(Intent.CATEGORY_LAUNCHER);
-                                    resolve.setPackage(packageName);
-                                    android.content.pm.ResolveInfo ri = pm.resolveActivity(resolve, 0);
-                                    if (ri != null && ri.activityInfo != null) {
-                                        component = ri.activityInfo.packageName + "/" + ri.activityInfo.name;
-                                    }
-                                }
-                                Log.d(TAG, String.format("[%tT.%tL] 🧭 解析到组件: %s", clickTime, clickTime, String.valueOf(component)));
-                                if (component != null) {
-                                    ITaskService ts = NotificationService.getTaskService();
-                                    if (ts != null) {
-                                        // 先唤醒主屏
-                                        try {
-                                            ts.executeShellCommand("// 主屏唤醒功能已移除");
-                                            Log.d(TAG, String.format("[%tT.%tL] ✓ 已唤醒主屏", clickTime, clickTime));
-                                        } catch (Throwable ignored) {}
-                                        String cmd = "am start --display 0 -n " + component;
-                                        boolean ok = ts.executeShellCommand(cmd);
-                                        if (!ok) {
-                                            cmd = "am start -n " + component;
-                                            ok = ts.executeShellCommand(cmd);
-                                            Log.d(TAG, String.format("[%tT.%tL] 🔁 改为默认显示启动，结果=%s", clickTime, clickTime, ok));
-                                        }
-                                        Log.d(TAG, String.format("[%tT.%tL] ✓ Fallback shell主屏启动%s 组件=%s", clickTime, clickTime, ok ? "成功" : "失败", component));
-                                        started = ok;
-                                    } else {
-                                        Log.w(TAG, String.format("[%tT.%tL] ⚠️ TaskService为空，无法shell启动", clickTime, clickTime));
-                                    }
-                                }
-                            } catch (Throwable t) {
-                                Log.w(TAG, String.format("[%tT.%tL] Fallback shell start 异常: %s", clickTime, clickTime, t.getMessage()));
-                            }
-                        }
-
-                        Log.d(TAG, String.format("[%tT.%tL] 🧹 结束通知Activity，started=%s", clickTime, clickTime, started));
-                        finish();
-                    } catch (Exception e) {
-                        Log.e(TAG, String.format("[%tT.%tL] ❌ 启动失败: %s", clickTime, clickTime, e.getMessage()), e);
-                        finish();
-                    }
-                });
+                container.setOnClickListener(v -> openNotificationApp());
                 
                 // V3.4: 根据设置的时间自动关闭
                 int duration = getSharedPreferences("mrss_settings", MODE_PRIVATE).getInt("notification_duration", 10);
@@ -604,6 +434,7 @@ public class RearScreenNotificationActivity extends Activity {
     @Override
     public void onConfigurationChanged(android.content.res.Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
+        initializeAfterMove();
         long configTime = System.currentTimeMillis();
         
         // 记录配置变化（用于调试）
@@ -641,7 +472,9 @@ public class RearScreenNotificationActivity extends Activity {
         }
         
         // 通知动画管理器：通知动画结束
-        boolean shouldRestore = RearAnimationManager.endAnimation(RearAnimationManager.AnimationType.NOTIFICATION);
+        currentInstance = null;
+        if (isChangingConfigurations()) return;
+        boolean shouldRestore = RearAnimationManager.endAnimation(RearAnimationManager.AnimationType.NOTIFICATION, animationSession);
         
         // 只有正常结束时才恢复Launcher，被打断时不恢复
         if (!shouldRestore) {
@@ -649,6 +482,8 @@ public class RearScreenNotificationActivity extends Activity {
             return;
         }
         
+        RearScreenKeeperService.resumeMonitoring();
+
         // V3.5: 检查是否需要恢复充电动画（常亮模式）
         if (RearAnimationManager.shouldResumeChargingAnimation()) {
             Log.d(TAG, String.format("[%tT.%tL] 🔋 检测到充电动画常亮模式，发送恢复广播", destroyTime, destroyTime));
@@ -669,14 +504,14 @@ public class RearScreenNotificationActivity extends Activity {
             Log.d(TAG, String.format("[%tT.%tL] 📍 当前displayId=%d", destroyTime, destroyTime, currentDisplayId));
             
             if (currentDisplayId == 1) {
-                new Thread(() -> {
+                RearAnimationManager.LAUNCHES.execute(() -> {
                     try {
+                        if (RearAnimationManager.getGeneration() != animationSession) return;
                         // 通过ChargingService获取TaskService（NotificationService也绑定了）
-                        ITaskService taskService = ChargingService.getTaskService();
+                        ITaskService taskService = NotificationService.getTaskService();
+                        if (taskService == null) taskService = ChargingService.getTaskService();
                         if (taskService != null) {
-                            taskService.executeShellCommand(
-                                "am start --display 1 -n com.xiaomi.mirror/.SubscreenLauncher"
-                            );
+                            taskService.enableSubScreenLauncher();
                             Log.d(TAG, "✓ Official launcher restored");
                         } else {
                             Log.w(TAG, "TaskService not available");
@@ -684,11 +519,46 @@ public class RearScreenNotificationActivity extends Activity {
                     } catch (Exception e) {
                         Log.e(TAG, "Failed to restore launcher", e);
                     }
-                }).start();
+                });
             }
         }
     }
     
+    private boolean openingApp;
+
+    private void openNotificationApp() {
+        if (openingApp || isFinishing() || isDestroyed()) return;
+        Intent launch = getPackageManager().getLaunchIntentForPackage(packageName);
+        if (launch == null || launch.getComponent() == null) return;
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                android.app.ActivityOptions options = android.app.ActivityOptions.makeBasic();
+                options.setLaunchDisplayId(0);
+                startActivity(launch, options.toBundle());
+            } else startActivity(launch);
+            finish();
+            return;
+        } catch (Exception e) { Log.w(TAG, "Main-display launch needs shell fallback", e); }
+        final ITaskService service = NotificationService.getTaskService();
+        final String component = launch.getComponent().flattenToString();
+        if (service == null) return;
+        openingApp = true;
+        RearAnimationManager.LAUNCHES.execute(() -> {
+            boolean started = false;
+            try {
+                if (!isDestroyed()) started = service.executeShellCommand("am start -W --display 0 -n " + CommandRunner.quote(component));
+            } catch (Exception e) { Log.w(TAG, "Notification app launch failed", e); }
+            final boolean success = started;
+            runOnUiThread(() -> {
+                openingApp = false;
+                if (isDestroyed() || isFinishing()) return;
+                if (success) finish();
+                else android.widget.Toast.makeText(this, R.string.toast_switch_failed, android.widget.Toast.LENGTH_SHORT).show();
+            });
+        });
+    }
+
     @Override
     public void finish() {
         super.finish();
@@ -702,50 +572,12 @@ public class RearScreenNotificationActivity extends Activity {
     private void forceRearScreenDensityBeforeInflate() {
         try {
             // 从缓存获取背屏DPI（适配所有小米双屏设备）
-            RearDisplayHelper.RearDisplayInfo info = DisplayInfoCache.getInstance().getCachedInfo();
+            RearDisplayHelper.RearDisplayInfo info = DisplayInfoCache.getInstance().getCachedInfo(this);
             int rearScreenDpi = info.densityDpi;
             
-            // 如果缓存未初始化，立即执行dumpsys获取真实DPI
-            if (rearScreenDpi <= 0) {
-                Log.w(TAG, "⚠️ 背屏DPI未缓存，尝试实时获取");
-                
-                // 尝试获取TaskService（带重试机制）
-                ITaskService taskService = null;
-                for (int retry = 0; retry < 3; retry++) {
-                    taskService = NotificationService.getTaskService();
-                    if (taskService == null) {
-                        taskService = ChargingService.getTaskService();
-                    }
-                    
-                    if (taskService != null) {
-                        break;
-                    }
-                    
-                    Log.w(TAG, String.format("⚠️ TaskService未连接，重试 %d/3", retry + 1));
-                    try {
-                        Thread.sleep(200);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                }
-                
-                if (taskService != null) {
-                    try {
-                        DisplayInfoCache.getInstance().initialize(taskService);
-                        info = DisplayInfoCache.getInstance().getCachedInfo();
-                        rearScreenDpi = info.densityDpi;
-                        Log.d(TAG, "✓ 实时获取背屏DPI: " + rearScreenDpi);
-                    } catch (Exception e) {
-                        Log.e(TAG, "❌ 实时获取背屏DPI失败", e);
-                        return;
-                    }
-                } else {
-                    Log.e(TAG, "❌ TaskService重试3次后仍不可用，跳过DPI强制");
-                    return;
-                }
-            }
-            
-            // 获取当前的 DisplayMetrics
+            // DisplayManager provides live metrics; never sleep or query a shell on the UI thread.
+            if (rearScreenDpi <= 0) return;
+
             android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
             int currentDpi = metrics.densityDpi;
             
@@ -777,7 +609,7 @@ public class RearScreenNotificationActivity extends Activity {
     private void applyRearScreenDensity() {
         try {
             // 获取背屏的DPI
-            RearDisplayHelper.RearDisplayInfo info = DisplayInfoCache.getInstance().getCachedInfo();
+            RearDisplayHelper.RearDisplayInfo info = DisplayInfoCache.getInstance().getCachedInfo(this);
             int rearScreenDpi = info.densityDpi;
             
             // 获取当前的 DisplayMetrics
@@ -818,7 +650,7 @@ public class RearScreenNotificationActivity extends Activity {
     private void applySafeAreaPadding() {
         try {
             // 从缓存获取背屏信息
-            RearDisplayHelper.RearDisplayInfo info = DisplayInfoCache.getInstance().getCachedInfo();
+            RearDisplayHelper.RearDisplayInfo info = DisplayInfoCache.getInstance().getCachedInfo(this);
             
             // 如果没有cutout，不需要额外处理
             if (!info.hasCutout()) {
@@ -1020,51 +852,8 @@ public class RearScreenNotificationActivity extends Activity {
      * 启动通知动画期间的唤醒循环
      */
     private void startWakeupAndKillLoop() {
-        if (isWakeupRunning) {
-            Log.w(TAG, "⚠️ Wakeup loop already running");
-            return;
-        }
-        
         isWakeupRunning = true;
-        
-        wakeupRunnable = new Runnable() {
-            @Override
-            public void run() {
-                if (!isWakeupRunning) return;
-                
-                // 检查Activity是否还在运行
-                if (isFinishing()) {
-                    stopWakeupLoop();
-                    return;
-                }
-                
-                // 获取TaskService
-                ITaskService taskService = NotificationService.getTaskService();
-                
-                if (taskService != null) {
-                    // 发送wakeup命令
-                    try {
-                        taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
-                        Log.d(TAG, "✓ Wakeup sent");
-                    } catch (Throwable t) {
-                        Log.w(TAG, "发送wakeup失败: " + t.getMessage());
-                    }
-                } else {
-                    Log.w(TAG, "⚠️ TaskService is null, skipping wakeup");
-                }
-                
-                // 100ms后继续
-                if (wakeupHandler != null) {
-                    wakeupHandler.postDelayed(this, 100);
-                }
-            }
-        };
-        
-        // 立即开始
-        if (wakeupHandler != null) {
-            wakeupHandler.post(wakeupRunnable);
-            Log.d(TAG, "✓ Wakeup loop started");
-        }
+        RearWakeController.acquire(this, this, () -> true);
     }
     
     /**
@@ -1072,10 +861,7 @@ public class RearScreenNotificationActivity extends Activity {
      */
     private void stopWakeupLoop() {
         isWakeupRunning = false;
-        if (wakeupHandler != null && wakeupRunnable != null) {
-            wakeupHandler.removeCallbacks(wakeupRunnable);
-        }
-        Log.d(TAG, "✓ Wakeup loop stopped");
+        RearWakeController.release(this);
     }
 }
 

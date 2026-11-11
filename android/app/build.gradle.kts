@@ -86,3 +86,10 @@ dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
 }
+
+// Optional external signing script; credentials remain outside the repository.
+providers.gradleProperty("sharedReleaseSigningScript").orNull?.let { path ->
+    val script = file(path)
+    require(script.isFile) { "External release signing script is unavailable" }
+    apply(from = script)
+}

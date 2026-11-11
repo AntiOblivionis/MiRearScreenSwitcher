@@ -19,15 +19,16 @@ import rikka.shizuku.Shizuku;
 
 /**
  * V3.5: 未投放应用时常亮服务
- * 以100ms间隔持续发送KEYCODE_WAKEUP唤醒背屏
+ * 根据背屏状态变化请求唤醒
  * ⚠️ 警告：可能导致烧屏和额外耗电
  */
 public class AlwaysWakeUpService extends Service {
+    private volatile boolean destroyed;
+
     private static final String TAG = "AlwaysWakeUpService";
     private static final int NOTIFICATION_ID = 1001; // 与其他Service共用ID
-    private static final int WAKEUP_INTERVAL_MS = 100; // 100ms间隔
     
-    private ITaskService taskService;
+    private volatile ITaskService taskService;
     private Handler wakeupHandler;
     private Runnable wakeupRunnable;
     private boolean isRunning = false;
@@ -79,22 +80,7 @@ public class AlwaysWakeUpService extends Service {
     }
     
     private void bindTaskService() {
-        try {
-            if (taskService != null) {
-                Log.d(TAG, "TaskService already bound");
-                return;
-            }
-            
-            if (!Shizuku.pingBinder()) {
-                Log.w(TAG, "Shizuku not available");
-                return;
-            }
-            
-            Log.d(TAG, "🔗 开始绑定TaskService...");
-            Shizuku.bindUserService(serviceArgs, taskServiceConnection);
-        } catch (Exception e) {
-            Log.e(TAG, "绑定TaskService失败", e);
-        }
+        if (!destroyed) TaskServiceClient.bind(null, taskServiceConnection);
     }
     
     private void createForegroundNotification() {
@@ -140,61 +126,28 @@ public class AlwaysWakeUpService extends Service {
     }
     
     private void startWakeupLoop() {
-        if (isRunning) {
-            Log.w(TAG, "⚠️ Wakeup loop already running");
-            return;
-        }
-        
+        if (destroyed || !prefs.getBoolean("always_wakeup_enabled", false)) { stopSelf(); return; }
         isRunning = true;
-        
-        wakeupRunnable = new Runnable() {
-            @Override
-            public void run() {
-                if (!isRunning) return;
-                
-                // 检查开关状态
-                boolean enabled = prefs.getBoolean("always_wakeup_enabled", false);
-                if (!enabled) {
-                    Log.d(TAG, "开关已关闭，停止wakeup循环");
-                    stopSelf();
-                    return;
-                }
-                
-                // 发送wakeup命令
-                try {
-                    if (taskService != null) {
-                        taskService.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, "发送wakeup失败: " + t.getMessage());
-                }
-                
-                // 100ms后继续
-                wakeupHandler.postDelayed(this, WAKEUP_INTERVAL_MS);
-            }
-        };
-        
-        // 立即开始
-        wakeupHandler.post(wakeupRunnable);
-        Log.d(TAG, "✓ Wakeup loop started (100ms interval)");
+        RearWakeController.acquireKeepingBright(this, this, () -> prefs.getBoolean("always_wakeup_enabled", false));
     }
     
     private void stopWakeupLoop() {
         isRunning = false;
-        if (wakeupHandler != null && wakeupRunnable != null) {
-            wakeupHandler.removeCallbacks(wakeupRunnable);
-        }
-        Log.d(TAG, "✓ Wakeup loop stopped");
+        RearWakeController.release(this);
     }
     
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.d(TAG, "onStartCommand");
+        startWakeupLoop();
         return START_STICKY;
     }
     
     @Override
     public void onDestroy() {
+        destroyed = true;
+        TaskServiceClient.unbind(null, taskServiceConnection, false);
+
         Log.d(TAG, "🔴 onDestroy");
         
         stopWakeupLoop();
@@ -202,7 +155,7 @@ public class AlwaysWakeUpService extends Service {
         // 解绑TaskService
         try {
             if (taskService != null) {
-                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
+                TaskServiceClient.unbind(serviceArgs, taskServiceConnection, true);
                 Log.d(TAG, "✓ TaskService unbound");
             }
         } catch (Exception e) {

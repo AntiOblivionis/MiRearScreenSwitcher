@@ -14,6 +14,8 @@
     <string name="toast_not_on_rear">应用不在背屏</string>
     <string name="toast_app_not_found">未找到要拉回的应用</string>
     <string name="toast_screenshot_saved">背屏截图已保存</string>
+    <string name="toast_screenshot_failed">背屏截图失败，请检查 Shizuku 和背屏状态</string>
+    <string name="toast_service_not_ready">服务未就绪，请检查 Shizuku</string>
     <string name="toast_please_switch_back">请先将%s切换回主屏</string>
     <string name="notif_kernel_service">MRSS内核服务</string>
     <string name="notif_running_on_rear">正在背屏运行</string>

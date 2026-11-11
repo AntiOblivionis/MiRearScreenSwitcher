@@ -19,4 +19,6 @@
     <string name="notif_running_on_rear">running on rear screen</string>
     <string name="notif_click_to_return">Tap to switch %s back to main screen</string>
     <string name="notif_mrss_running">MRSS is currently running</string>
+    <string name="toast_screenshot_failed">Rear screen screenshot failed. Check Shizuku and the display.</string>
+    <string name="toast_service_not_ready">Service not ready. Check Shizuku.</string>
 </resources>

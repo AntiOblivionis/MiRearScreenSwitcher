@@ -19,4 +19,6 @@
     <string name="notif_running_on_rear">正在背屏運行</string>
     <string name="notif_click_to_return">點擊將 %s 切換回主屏</string>
     <string name="notif_mrss_running">MRSS目前正在運行</string>
+    <string name="toast_screenshot_failed">背螢幕截圖失敗，請檢查 Shizuku 和背螢幕狀態</string>
+    <string name="toast_service_not_ready">服務未就緒，請檢查 Shizuku</string>
 </resources>

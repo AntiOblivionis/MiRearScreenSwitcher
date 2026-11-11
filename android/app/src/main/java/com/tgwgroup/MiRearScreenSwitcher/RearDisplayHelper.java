@@ -32,14 +32,16 @@ public class RearDisplayHelper {
      * 背屏信息数据类
      */
     public static class RearDisplayInfo {
+        public boolean verified;
         public int width;           // 屏幕宽度（像素）
         public int height;          // 屏幕高度（像素）
         public int densityDpi;      // DPI
         public Rect cutout;         // Cutout区域（insets格式）        
         public RearDisplayInfo() {
-            // 默认值（小米14 Ultra背屏）            width = 1200;
-            height = 2200;
-            densityDpi = 440;
+            // Layout fallback only, never evidence that the rear display exists.
+            width = 904;
+            height = 572;
+            densityDpi = 450;
             cutout = new Rect(0, 0, 0, 0);
         }
         
@@ -100,12 +102,13 @@ public class RearDisplayHelper {
         try {
             // 方法1: 从 mViewports 中解析（最准确）
             Pattern viewportPattern = Pattern.compile(
-                "displayId=1[^}]*deviceWidth=(\\d+),\\s*deviceHeight=(\\d+)"
+                "displayId=1\\b[^}]*deviceWidth=(\\d+),\\s*deviceHeight=(\\d+)"
             );
             Matcher viewportMatcher = viewportPattern.matcher(dumpsys);
             if (viewportMatcher.find()) {
                 info.width = Integer.parseInt(viewportMatcher.group(1));
                 info.height = Integer.parseInt(viewportMatcher.group(2));
+                info.verified = info.width > 0 && info.height > 0;
                 Log.d(TAG, String.format("✓ 从mViewports解析分辨率: %dx%d", info.width, info.height));
             }
             
@@ -115,7 +118,7 @@ public class RearDisplayHelper {
             int display1DeviceStart = -1;
             
             // 先尝试找到包含 displayId=1 的 DisplayViewport 来获取 uniqueId
-            Pattern uniqueIdPattern = Pattern.compile("displayId=1[^}]*uniqueId='([^']+)'");
+            Pattern uniqueIdPattern = Pattern.compile("displayId=1\\b[^}]*uniqueId='([^']+)'");
             Matcher uniqueIdMatcher = uniqueIdPattern.matcher(dumpsys);
             String display1UniqueId = null;
             if (uniqueIdMatcher.find()) {
@@ -130,13 +133,14 @@ public class RearDisplayHelper {
                 if (idx == -1) break;
                 
                 // 检查接下来2000字符内是否有匹配条件
-                int checkEnd = Math.min(idx + 2000, dumpsys.length());
+                int nextDevice = dumpsys.indexOf("DisplayDeviceInfo", idx + 17);
+                int checkEnd = nextDevice >= 0 ? nextDevice : dumpsys.length();
                 String snippet = dumpsys.substring(idx, checkEnd);
                 
                 boolean isDisplay1 = false;
                 if (display1UniqueId != null && snippet.contains(display1UniqueId)) {
                     isDisplay1 = true;
-                } else if (snippet.contains(info.width + " x " + info.height)) {
+                } else if (display1UniqueId == null && info.verified && snippet.contains(info.width + " x " + info.height)) {
                     // 用已解析的分辨率匹配（904 x 572）
                     isDisplay1 = true;
                 }

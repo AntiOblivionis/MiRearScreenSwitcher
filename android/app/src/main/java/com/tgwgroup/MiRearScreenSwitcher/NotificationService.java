@@ -46,6 +46,8 @@ import rikka.shizuku.Shizuku;
  * 监听系统通知，将选中应用的通知显示到背屏
  */
 public class NotificationService extends NotificationListenerService {
+    private volatile boolean destroyed;
+
     private static final String TAG = "NotificationService";
     private static final int NOTIFICATION_ID = 1001; // 与其他Service共用ID
     
@@ -56,7 +58,7 @@ public class NotificationService extends NotificationListenerService {
     private boolean onlyWhenLocked = false; // 仅倒扣手机时通知（默认关闭）
     private boolean notificationDarkMode = false; // 通知暗夜模式（默认关闭）
     private boolean serviceEnabled = false; // 服务是否启用
-    private ITaskService taskService; // 自己的TaskService实例
+    private volatile ITaskService taskService; // 自己的TaskService实例
     private SharedPreferences prefs;
     private PowerManager.WakeLock wakeLock;
     
@@ -101,7 +103,7 @@ public class NotificationService extends NotificationListenerService {
             
             // 初始化显示屏信息缓存
             try {
-                DisplayInfoCache.getInstance().initialize(taskService);
+                DisplayInfoCache.getInstance().initializeAsync(taskService);
             } catch (Exception e) {
                 Log.w(TAG, "初始化显示屏缓存失败: " + e.getMessage());
             }
@@ -150,11 +152,7 @@ public class NotificationService extends NotificationListenerService {
         
         // 注册广播接收器（监听设置变化）
         IntentFilter filter = new IntentFilter("com.tgwgroup.MiRearScreenSwitcher.RELOAD_NOTIFICATION_SETTINGS");
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(settingsReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(settingsReceiver, filter);
-        }
+        androidx.core.content.ContextCompat.registerReceiver(this, settingsReceiver, filter, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
         Log.d(TAG, "✓ 广播接收器已注册");
         
         // 添加Shizuku监听器
@@ -180,22 +178,7 @@ public class NotificationService extends NotificationListenerService {
     }
     
     private void bindTaskService() {
-        try {
-            if (taskService != null) {
-                Log.d(TAG, "TaskService already bound");
-                return;
-            }
-            
-            if (!Shizuku.pingBinder()) {
-                Log.w(TAG, "Shizuku not available");
-                return;
-            }
-            
-            Log.d(TAG, "🔗 开始绑定TaskService...");
-            Shizuku.bindUserService(serviceArgs, taskServiceConnection);
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to bind TaskService", e);
-        }
+        if (!destroyed) TaskServiceClient.bind(null, taskServiceConnection);
     }
     
     /**
@@ -325,12 +308,12 @@ public class NotificationService extends NotificationListenerService {
             Log.d(TAG, "✓ 应用在选中列表中: " + packageName);
             
             // 提取通知内容
-            String title = notification.extras.getString(Notification.EXTRA_TITLE, "");
-            String text = notification.extras.getString(Notification.EXTRA_TEXT, "");
+            CharSequence rawTitle = notification.extras.getCharSequence(Notification.EXTRA_TITLE);
+            CharSequence rawText = notification.extras.getCharSequence(Notification.EXTRA_TEXT);
+            String title = rawTitle == null ? "" : rawTitle.toString();
+            String text = rawText == null ? "" : rawText.toString();
             long when = notification.when;
             
-            Log.d(TAG, "📝 通知标题: " + title);
-            Log.d(TAG, "📝 通知内容: " + text);
             
             // V3.2: 隐私模式处理（区分标题和内容）
             if (privacyHideTitle) {
@@ -346,223 +329,54 @@ public class NotificationService extends NotificationListenerService {
             
             // 通知动画管理器：开始通知动画（返回被打断的旧动画）
             RearAnimationManager.AnimationType oldAnim = RearAnimationManager.startAnimation(RearAnimationManager.AnimationType.NOTIFICATION);
-            
-            // 如果有旧动画需要打断，发送打断广播
+            final long session = RearAnimationManager.getGeneration();
+            final String displayTitle = title;
+            final String displayText = text;
             if (oldAnim == RearAnimationManager.AnimationType.CHARGING) {
-                Log.d(TAG, "🔄 检测到充电动画正在播放，发送打断广播");
-                
-                // V3.5: 检查充电动画是否是常亮模式
-                boolean chargingAlwaysOn = prefs.getBoolean("charging_always_on_enabled", false);
-                RearAnimationManager.markInterruptedChargingAsAlwaysOn(chargingAlwaysOn);
-                
-                RearAnimationManager.sendInterruptBroadcast(this, RearAnimationManager.AnimationType.CHARGING);
-            } else if (oldAnim == RearAnimationManager.AnimationType.NOTIFICATION) {
-                Log.d(TAG, "🔄 检测到通知动画正在播放，发送打断广播并重载");
-                RearAnimationManager.sendInterruptBroadcast(this, RearAnimationManager.AnimationType.NOTIFICATION);
-                
-                // 延迟600ms后重新启动通知动画，确保旧动画完全停止（锁屏+投送app下需要更多时间）
-                final String finalPackageName = packageName;
-                final String finalTitle = title;
-                final String finalText = text;
-                final long finalWhen = when;
-                new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-                    Log.d(TAG, "🔄 重载通知动画");
-                    showNotificationOnRearScreen(finalPackageName, finalTitle, finalText, finalWhen);
-                }, 600);
-                return; // 提前返回，避免重复启动
+                RearAnimationManager.markInterruptedChargingAsAlwaysOn(prefs.getBoolean("charging_always_on_enabled", false));
             }
-            
-            // 触发背屏通知显示
-            showNotificationOnRearScreen(packageName, title, text, when);
-            
+            if (oldAnim != RearAnimationManager.AnimationType.NONE) RearAnimationManager.sendInterruptBroadcast(this, oldAnim);
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+                if (!destroyed && RearAnimationManager.isCurrent(RearAnimationManager.AnimationType.NOTIFICATION, session)) {
+                    showNotificationOnRearScreen(packageName, displayTitle, displayText, when);
+                }
+            }, oldAnim == RearAnimationManager.AnimationType.NONE ? 0 : 150);
+
         } catch (Exception e) {
             Log.e(TAG, "❌ 处理通知时出错", e);
         }
     }
     
     private void showNotificationOnRearScreen(String packageName, String title, String text, long when) {
-        // 参考ChargingService的重试机制
-        if (taskService == null) {
-            Log.w(TAG, "⚠️ TaskService未连接，尝试重新绑定...");
-            bindTaskService();
-            
-            // 延迟500ms后重试
-            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-                showNotificationOnRearScreenDirect(packageName, title, text, when);
-            }, 500);
-        } else {
-            showNotificationOnRearScreenDirect(packageName, title, text, when);
-        }
+        final long session = RearAnimationManager.getGeneration();
+        RearAnimationManager.LAUNCHES.execute(() -> {
+            if (destroyed || !RearAnimationManager.isCurrent(RearAnimationManager.AnimationType.NOTIFICATION, session)) return;
+            showNotificationOnRearScreenDirect(packageName, title, text, when, session);
+        });
     }
     
-    private void showNotificationOnRearScreenDirect(String packageName, String title, String text, long when) {
+    private void showNotificationOnRearScreenDirect(String packageName, String title, String text, long when, long session) {
+        boolean launched = false;
         try {
-            if (taskService == null) {
-                Log.e(TAG, "❌ TaskService仍然不可用，放弃显示通知");
-                return;
-            }
-            
-            // 短时局部保活，避免在锁屏/重负载下被挂起
-            acquireWakeLock(6000);
-            Log.d(TAG, "🎯 准备启动Activity显示通知");
-            
-            // 锁屏状态检查
-            android.app.KeyguardManager km = (android.app.KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
-            boolean isLocked = km != null && km.isKeyguardLocked();
-            
-            // 读取主屏前台应用（用于同包名前台场景的保护）
-            String mainForegroundApp = null;
-            try {
-                mainForegroundApp = taskService.getForegroundAppOnDisplay(0);
-                Log.d(TAG, "📱 主屏前台应用: " + mainForegroundApp);
-            } catch (Throwable t) {
-                Log.w(TAG, "获取主屏前台应用失败: " + t.getMessage());
-            }
-            
-            // V3.3: 移除唤醒代码，避免锁屏时跳转到密码界面
-            
-            try {
-                // 暂停监控，防止被误杀
-                RearScreenKeeperService.pauseMonitoring();
-            } catch (Throwable t) {
-                Log.w(TAG, "pauseMonitoring failed: " + t.getMessage());
-            }
-            
-            try {
-                // 禁用背屏官方Launcher，避免抢占
-                taskService.disableSubScreenLauncher();
-            } catch (Throwable t) {
-                Log.w(TAG, "disableSubScreenLauncher failed: " + t.getMessage());
-            }
-            
-            // V3.3: 移除 wm dismiss-keyguard 命令，避免锁屏时跳转到密码界面
-            
-            // 2) 根据锁屏状态与前台应用选择启动策略
-            String componentName = getPackageName() + "/" + RearScreenNotificationActivity.class.getName();
-            
-            // 当锁屏且主屏前台就是本条通知所属应用时，避免主屏占位策略，改为直接背屏启动，防止系统冲突
-            // 精确匹配包名，避免误判（如 com.tencent.mm 和 com.tencent.mobileqq）
-            boolean forceDirectRearDueToSameApp = false;
-            if (isLocked && mainForegroundApp != null && !mainForegroundApp.isEmpty()) {
-                // 提取主屏前台应用的包名（格式可能是 "com.example.app/com.example.app.MainActivity"）
-                String foregroundPackage = mainForegroundApp;
-                if (mainForegroundApp.contains("/")) {
-                    foregroundPackage = mainForegroundApp.split("/")[0];
-                }
-                forceDirectRearDueToSameApp = foregroundPackage.equals(packageName);
-                Log.d(TAG, String.format("🔍 锁屏同包检查: 主屏前台=[%s] vs 通知包名=[%s] -> %s",
-                    foregroundPackage, packageName, forceDirectRearDueToSameApp ? "匹配(直接背屏)" : "不匹配(占位策略)"));
-            }
-            
-            // ✅ 统一策略：无论锁屏与否，都直接在背屏启动（避免DPI不匹配问题）
-            // 直接在背屏启动可以确保布局使用正确的DPI（450），避免从主屏移动导致的尺寸问题
-            
-            // 确保暗夜模式设置是最新的
-            notificationDarkMode = prefs.getBoolean("notification_dark_mode", false);
-            Log.d(TAG, "🌙 当前暗夜模式设置: " + notificationDarkMode);
-            
-            String directCmd = String.format(
-                "am start --display 1 -n %s --es packageName \"%s\" --es title \"%s\" --es text \"%s\" --el when %d --ez darkMode %b",
-                componentName,
-                packageName,
-                title.replace("\"", "\\\""),
-                text.replace("\"", "\\\""),
-                when,
-                notificationDarkMode
-            );
-            
-            boolean started = false;
-            // 尝试3次直接启动，确保成功
-            for (int retry = 0; retry < 3; retry++) {
-                try {
-                    taskService.executeShellCommand(directCmd);
-                    Log.d(TAG, String.format("✓ %s，直接在背屏启动通知Activity (尝试%d)",
-                        isLocked ? "锁屏状态" : "非锁屏状态", retry + 1));
-                    try { Thread.sleep(150); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-                    
-                    // 检查是否启动成功
-                    String check = taskService.executeShellCommandWithResult("am stack list | grep RearScreenNotificationActivity");
-                    if (check != null && !check.trim().isEmpty()) {
-                        started = true;
-                        Log.d(TAG, "✓ 通知动画已在背屏启动");
-                        break;
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, String.format("尝试%d失败: %s", retry + 1, t.getMessage()));
-                }
-            }
-            
-            // 如果直接启动失败，使用备用策略（主屏占位+移动）
-            if (!started && isLocked) {
-                Log.w(TAG, "⚠️ 直接背屏启动失败，回退到主屏占位+移动策略");
-                
-                // 主屏启动（Activity 自行占位）
-                String startOnMainCmd = String.format(
-                    "am start -n %s --es packageName \"%s\" --es title \"%s\" --es text \"%s\" --el when %d --ez darkMode %b",
-                    componentName,
-                    packageName,
-                    title.replace("\"", "\\\""),
-                    text.replace("\"", "\\\""),
-                    when,
-                    notificationDarkMode
-                );
-                Log.d(TAG, "🔵 在主屏启动通知Activity（占位符）");
-                taskService.executeShellCommand(startOnMainCmd);
-                try { Thread.sleep(50); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-                
-                // 轮询获取taskId
-                String notifTaskId = null;
-                int attempts = 0;
-                int maxAttempts = 60;
-                while (notifTaskId == null && attempts < maxAttempts) {
-                    try { Thread.sleep(40); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-                    String result = taskService.executeShellCommandWithResult("am stack list | grep RearScreenNotificationActivity");
-                    if (result != null && !result.trim().isEmpty()) {
-                        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("taskId=(\\d+)");
-                        java.util.regex.Matcher matcher = pattern.matcher(result);
-                        if (matcher.find()) {
-                            notifTaskId = matcher.group(1);
-                            Log.d(TAG, "🎯 找到通知taskId=" + notifTaskId);
-                            break;
-                        }
-                    }
-                    attempts++;
-                }
-                
-                if (notifTaskId != null) {
-                    // 4) 移动到背屏
-                    String moveCmd = "service call activity_task 50 i32 " + notifTaskId + " i32 1";
-                    taskService.executeShellCommand(moveCmd);
-                    try { Thread.sleep(60); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-                    
-                    // 5) 锁屏时关闭主屏，避免主屏抢焦点
-                    // 主屏休眠功能已移除
-                    Log.d(TAG, "🔒 锁屏状态，主屏已关闭");
-                    
-                    Log.d(TAG, "✓ 通知动画已移动到背屏");
-                } else {
-                    Log.e(TAG, "❌ 未能找到通知Activity的taskId，最后尝试直接在背屏启动");
-                    try {
-                        String fallbackCmd = String.format(
-                            "am start --display 1 -n %s --es packageName \"%s\" --es title \"%s\" --es text \"%s\" --el when %d --ez darkMode %b",
-                            componentName,
-                            packageName,
-                            title.replace("\"", "\\\""),
-                            text.replace("\"", "\\\""),
-                            when,
-                            notificationDarkMode
-                        );
-                        taskService.executeShellCommand(fallbackCmd);
-                        Log.d(TAG, "🟦 已尝试直接 --display 1 启动通知Activity（fallback）");
-                    } catch (Throwable t) {
-                        Log.w(TAG, "Fallback直接在背屏启动失败: " + t.getMessage());
-                    }
-                }
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "❌ 显示背屏通知失败", e);
-        } finally {
+            ITaskService service = taskService;
+            if (service == null) return;
+            acquireWakeLock(8000);
+            service.disableSubScreenLauncher();
+            android.os.Bundle extras = new android.os.Bundle();
+            extras.putString("packageName", packageName);
+            extras.putString("title", title);
+            extras.putString("text", text);
+            extras.putLong("when", when);
+            extras.putLong("animationSession", session);
+            extras.putBoolean("darkMode", prefs.getBoolean("notification_dark_mode", false));
+            if (destroyed || !RearAnimationManager.isCurrent(RearAnimationManager.AnimationType.NOTIFICATION, session)) return;
+            launched = service.launchRearActivity(getPackageName() + "/" + RearScreenNotificationActivity.class.getName(), extras);
+        } catch (Exception e) { Log.w(TAG, "Rear notification launch failed", e); }
+        finally {
             releaseWakeLock();
+            if (!launched && RearAnimationManager.endAnimation(RearAnimationManager.AnimationType.NOTIFICATION, session)) {
+                RearScreenKeeperService.resumeMonitoring();
+            }
         }
     }
 
@@ -714,6 +528,9 @@ public class NotificationService extends NotificationListenerService {
     
     @Override
     public void onDestroy() {
+        destroyed = true;
+        TaskServiceClient.unbind(null, taskServiceConnection, false);
+
         super.onDestroy();
         Log.d(TAG, "🔴 NotificationService destroyed");
         
@@ -736,7 +553,7 @@ public class NotificationService extends NotificationListenerService {
         // 解绑TaskService
         try {
             if (taskService != null) {
-                Shizuku.unbindUserService(serviceArgs, taskServiceConnection, true);
+                TaskServiceClient.unbind(serviceArgs, taskServiceConnection, true);
                 taskService = null;
             }
         } catch (Exception e) {

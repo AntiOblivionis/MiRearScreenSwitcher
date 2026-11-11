@@ -18,7 +18,7 @@ import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:ui';
 import 'dart:math' as math;
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'l10n/app_localizations.dart';
@@ -147,12 +147,12 @@ class _HomePageState extends State<HomePage> {
     _checkShizuku();
     _loadSettings(); // 加载所有设置
     _setupMethodCallHandler();
-    _loadProximitySensorSetting(); // 加载接近传感器设置
 
     // 通知权限会在Shizuku授权完成后自动请求（见_checkShizuku）
 
     // 延迟获取DPI和旋转，等待TaskService连接
     Future.delayed(const Duration(seconds: 2), () {
+      if (!mounted) return;
       _getCurrentRearDpi();
       _getCurrentRotation();
     });
@@ -160,6 +160,7 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    platform.setMethodCallHandler(null);
     _dpiController.dispose();
     _dpiFocusNode.dispose();
     super.dispose();
@@ -167,15 +168,17 @@ class _HomePageState extends State<HomePage> {
 
   void _setupMethodCallHandler() {
     platform.setMethodCallHandler((call) async {
+      if (!mounted) return;
       if (call.method == 'onShizukuPermissionChanged') {
         final granted = call.arguments as bool;
-        print('Shizuku permission changed: $granted');
+        if (kDebugMode) debugPrint('Shizuku permission changed: $granted');
         // 刷新状态
         await _checkShizuku();
+        if (!mounted) return;
 
         // Shizuku授权完成后，立即请求通知权限
         if (granted) {
-          print('✓ Shizuku已授权，立即请求通知权限');
+          if (kDebugMode) debugPrint('✓ Shizuku已授权，立即请求通知权限');
           _requestNotificationPermission();
         }
       }
@@ -183,34 +186,37 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _requestNotificationPermission() async {
+    if (!mounted) return;
     // Android 13+ 需要请求通知权限
     try {
       await platform.invokeMethod('requestNotificationPermission');
-      print('通知权限请求已发送');
+      if (kDebugMode) debugPrint('通知权限请求已发送');
     } catch (e) {
-      print('请求通知权限失败: $e');
+      if (kDebugMode) debugPrint('请求通知权限失败: $e');
     }
   }
 
   // V15: 获取当前背屏DPI
   Future<void> _getCurrentRearDpi() async {
+    if (!mounted) return;
     setState(() {
       _dpiLoading = true;
     });
 
     // 最多重试5次，每次间隔1秒
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 5 && mounted; i++) {
       try {
         final int dpi = await platform.invokeMethod('getCurrentRearDpi');
+        if (!mounted) return;
         setState(() {
           _currentRearDpi = dpi;
           _dpiController.text = dpi.toString();
           _dpiLoading = false;
         });
-        print('当前背屏DPI: $dpi');
+        if (kDebugMode) debugPrint('当前背屏DPI: $dpi');
         return; // 成功就退出
       } catch (e) {
-        print('获取背屏DPI失败 (尝试 ${i + 1}/5): $e');
+        if (kDebugMode) debugPrint('获取背屏DPI失败 (尝试 ${i + 1}/5): $e');
         if (i < 4) {
           await Future.delayed(const Duration(seconds: 1));
         }
@@ -218,108 +224,66 @@ class _HomePageState extends State<HomePage> {
     }
 
     // 所有重试都失败
+    if (!mounted) return;
     setState(() {
       _dpiLoading = false;
       _currentRearDpi = 0;
     });
-    print('获取背屏DPI最终失败');
+    if (kDebugMode) debugPrint('获取背屏DPI最终失败');
   }
 
-  // V15: 设置背屏DPI
-  Future<void> _setRearDpi(int dpi) async {
-    if (_isLoading) return;
+  Future<void> _setRearDpi(int dpi) => _applyRearDpi(dpi);
+  Future<void> _resetRearDpi() => _applyRearDpi(null);
 
-    setState(() {
-      _isLoading = true;
-    });
-
+  Future<void> _applyRearDpi(int? dpi) async {
+    if (!mounted || _isLoading) return;
+    setState(() => _isLoading = true);
     try {
-      // 先尝试重新连接TaskService，确保连接正常
-      await platform.invokeMethod('ensureTaskServiceConnected');
-
-      // 等待连接建立
-      await Future.delayed(const Duration(milliseconds: 500));
-
-      await platform.invokeMethod('setRearDpi', {'dpi': dpi});
-
-      // 刷新当前DPI
-      await _getCurrentRearDpi();
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '${AppLocalizations.of(context).translate('toast_dpi_set')} $dpi',
-            ),
-          ),
+      final connected = await platform.invokeMethod<bool>(
+        'ensureTaskServiceConnected',
+      );
+      if (!mounted) return;
+      if (connected != true) {
+        throw PlatformException(
+          code: 'NOT_CONNECTED',
+          message: 'TaskService unavailable',
         );
       }
+      final success = dpi == null
+          ? await platform.invokeMethod<bool>('resetRearDpi')
+          : await platform.invokeMethod<bool>('setRearDpi', {'dpi': dpi});
+      if (!mounted) return;
+      if (success != true) {
+        throw PlatformException(
+          code: 'REJECTED',
+          message: 'DPI change rejected',
+        );
+      }
+      await _getCurrentRearDpi();
+      if (!mounted) return;
+      final text = AppLocalizations.of(
+        context,
+      ).translate(dpi == null ? 'toast_dpi_reset' : 'toast_dpi_set');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(dpi == null ? text : '$text $dpi')),
+      );
     } catch (e) {
-      print('设置背屏DPI失败: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '${AppLocalizations.of(context).translate('toast_set_failed')} $e. ${AppLocalizations.of(context).translate('toast_ensure_shizuku')}',
+              '${AppLocalizations.of(context).translate('toast_set_failed')} $e',
             ),
           ),
         );
       }
     } finally {
-      setState(() {
-        _isLoading = false;
-      });
-    }
-  }
-
-  // V15: 还原背屏DPI
-  Future<void> _resetRearDpi() async {
-    if (_isLoading) return;
-
-    setState(() {
-      _isLoading = true;
-    });
-
-    try {
-      // 先尝试重新连接TaskService，确保连接正常
-      await platform.invokeMethod('ensureTaskServiceConnected');
-
-      // 等待连接建立
-      await Future.delayed(const Duration(milliseconds: 500));
-
-      await platform.invokeMethod('resetRearDpi');
-
-      // 刷新当前DPI
-      await _getCurrentRearDpi();
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              AppLocalizations.of(context).translate('toast_dpi_reset'),
-            ),
-          ),
-        );
-      }
-    } catch (e) {
-      print('还原背屏DPI失败: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '${AppLocalizations.of(context).translate('toast_reset_failed')} $e. ${AppLocalizations.of(context).translate('toast_ensure_shizuku')}',
-            ),
-          ),
-        );
-      }
-    } finally {
-      setState(() {
-        _isLoading = false;
-      });
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
   Future<void> _checkShizuku() async {
+    if (!mounted) return;
     setState(() {
       _shizukuStatus = ShizukuStatus.checking;
       _hasError = false;
@@ -333,7 +297,6 @@ class _HomePageState extends State<HomePage> {
           .timeout(const Duration(seconds: 3));
 
       if (!mounted) return;
-
       setState(() {
         _shizukuRunning = result == true;
         _hasError = false;
@@ -343,7 +306,7 @@ class _HomePageState extends State<HomePage> {
           _shizukuStatus = ShizukuStatus.running;
 
           // Shizuku已授权，立即请求通知权限
-          print('✓ Shizuku已授权，立即请求通知权限');
+          if (kDebugMode) debugPrint('✓ Shizuku已授权，立即请求通知权限');
           _requestNotificationPermission();
         } else {
           _hasError = true;
@@ -398,21 +361,26 @@ class _HomePageState extends State<HomePage> {
             ? '${errorMsg.substring(0, 50)}...'
             : errorMsg;
       }
-      setState(() {
-        _shizukuRunning = false;
-        _hasError = true;
-        _shizukuStatus = ShizukuStatus.error;
-        _customErrorTitle = errorType;
-      });
+      if (mounted) {
+        setState(() {
+          _shizukuRunning = false;
+          _hasError = true;
+          _shizukuStatus = ShizukuStatus.error;
+          _customErrorTitle = errorType;
+        });
+      }
     }
   }
 
   Future<void> _getDetailedStatus() async {
+    if (!mounted) return;
     try {
       final info = await platform.invokeMethod('getShizukuInfo');
-      setState(() {
-        _errorDetail = info.toString();
-      });
+      if (mounted) {
+        setState(() {
+          _errorDetail = info.toString();
+        });
+      }
     } catch (e) {
       // 获取详细信息失败，保持当前错误信息
     }
@@ -420,35 +388,41 @@ class _HomePageState extends State<HomePage> {
 
   // V2.1: 重启应用
   Future<void> _restartApp() async {
-    if (_isLoading) return;
-
+    if (!mounted || _isLoading) return;
     setState(() => _isLoading = true);
-
     try {
-      // 确保TaskService连接
-      await platform.invokeMethod('ensureTaskServiceConnected');
-      await Future.delayed(const Duration(milliseconds: 500));
-
-      // 检查是否有应用在背屏
-      final result = await platform.invokeMethod('returnRearAppAndRestart');
-
-      if (result == true) {
-        // 成功返回主屏，退出应用
-        SystemNavigator.pop();
-      } else {
-        // 没有应用在背屏，直接退出
-        SystemNavigator.pop();
-      }
+      final connected = await platform.invokeMethod<bool>(
+        'ensureTaskServiceConnected',
+      );
+      if (!mounted) return;
+      if (connected != true) throw PlatformException(code: 'NOT_CONNECTED');
+      final returned = await platform.invokeMethod<bool>(
+        'returnRearAppAndRestart',
+      );
+      if (!mounted) return;
+      if (returned != true) throw PlatformException(code: 'RETURN_FAILED');
+      await SystemNavigator.pop();
     } catch (e) {
-      // 出错也退出
-      SystemNavigator.pop();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${AppLocalizations.of(context).translate('toast_set_failed')} $e',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
   // V2.2: 加载所有设置
   Future<void> _loadSettings() async {
+    if (!mounted) return;
     try {
       final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
       setState(() {
         _proximitySensorEnabled =
             prefs.getBool('proximity_sensor_enabled') ?? true;
@@ -472,6 +446,15 @@ class _HomePageState extends State<HomePage> {
         _startChargingService();
       }
 
+      // Restore the persisted switch after an app/process restart, including an update.
+      try {
+        await platform.invokeMethod('setAlwaysWakeUpEnabled', {
+          'enabled': _alwaysWakeUpEnabled,
+        });
+      } catch (e) {
+        if (kDebugMode) debugPrint('恢复背屏常亮服务失败: $e');
+      }
+
       // 检查通知监听权限（但不覆盖开关状态）
       _checkNotificationPermission();
 
@@ -480,49 +463,39 @@ class _HomePageState extends State<HomePage> {
         _startNotificationService();
       }
     } catch (e) {
-      print('加载设置失败: $e');
-    }
-  }
-
-  // V2.2: 加载接近传感器设置
-  Future<void> _loadProximitySensorSetting() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      setState(() {
-        _proximitySensorEnabled =
-            prefs.getBool('proximity_sensor_enabled') ?? true;
-      });
-    } catch (e) {
-      print('加载接近传感器设置失败: $e');
+      if (kDebugMode) debugPrint('加载设置失败: $e');
     }
   }
 
   // V2.4: 检查通知监听权限
   Future<void> _checkNotificationPermission() async {
+    if (!mounted) return;
     try {
       final bool hasPermission = await platform.invokeMethod(
         'checkNotificationListenerPermission',
       );
       // 只更新权限状态，不覆盖开关状态
       // _notificationEnabled 现在由 SharedPreferences 中的开关状态控制
-      print('通知监听权限状态: $hasPermission');
+      if (kDebugMode) debugPrint('通知监听权限状态: $hasPermission');
     } catch (e) {
-      print('检查通知权限失败: $e');
+      if (kDebugMode) debugPrint('检查通知权限失败: $e');
     }
   }
 
   // V2.4: 启动通知服务
   Future<void> _startNotificationService() async {
+    if (!mounted) return;
     try {
       await platform.invokeMethod('startNotificationService');
-      print('NotificationService已启动');
+      if (kDebugMode) debugPrint('NotificationService已启动');
     } catch (e) {
-      print('启动NotificationService失败: $e');
+      if (kDebugMode) debugPrint('启动NotificationService失败: $e');
     }
   }
 
   // V2.4: 切换通知服务
   Future<void> _toggleNotificationService(bool enabled) async {
+    if (!mounted) return;
     if (enabled) {
       // 先检查权限
       final bool hasPermission = await platform.invokeMethod(
@@ -550,21 +523,26 @@ class _HomePageState extends State<HomePage> {
         await _startNotificationService();
       }
 
-      setState(() {
-        _notificationEnabled = enabled;
-      });
-      print('背屏通知服务已${enabled ? "启用" : "禁用"}');
+      if (mounted) {
+        setState(() {
+          _notificationEnabled = enabled;
+        });
+      }
+      if (kDebugMode) debugPrint('背屏通知服务已${enabled ? "启用" : "禁用"}');
     } catch (e) {
-      print('切换背屏通知服务失败: $e');
+      if (kDebugMode) debugPrint('切换背屏通知服务失败: $e');
       // 切换失败，恢复原状态
-      setState(() {
-        _notificationEnabled = !enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _notificationEnabled = !enabled;
+        });
+      }
     }
   }
 
   // V2.4: 打开应用选择页面
   Future<void> _openAppSelectionPage() async {
+    if (!mounted) return;
     await Navigator.push(
       context,
       MaterialPageRoute(builder: (context) => const AppSelectionPage()),
@@ -573,6 +551,7 @@ class _HomePageState extends State<HomePage> {
 
   // V2.2: 切换接近传感器开关
   Future<void> _toggleProximitySensor(bool enabled) async {
+    if (!mounted) return;
     try {
       // 先保存到SharedPreferences
       final prefs = await SharedPreferences.getInstance();
@@ -583,21 +562,26 @@ class _HomePageState extends State<HomePage> {
         'enabled': enabled,
       });
 
-      setState(() {
-        _proximitySensorEnabled = enabled;
-      });
-      print('接近传感器已${enabled ? "启用" : "禁用"}');
+      if (mounted) {
+        setState(() {
+          _proximitySensorEnabled = enabled;
+        });
+      }
+      if (kDebugMode) debugPrint('接近传感器已${enabled ? "启用" : "禁用"}');
     } catch (e) {
-      print('切换接近传感器失败: $e');
+      if (kDebugMode) debugPrint('切换接近传感器失败: $e');
       // 切换失败，恢复原状态
-      setState(() {
-        _proximitySensorEnabled = !enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _proximitySensorEnabled = !enabled;
+        });
+      }
     }
   }
 
   // V2.3: 切换充电动画开关
   Future<void> _toggleChargingAnimation(bool enabled) async {
+    if (!mounted) return;
     try {
       // 先保存到SharedPreferences
       final prefs = await SharedPreferences.getInstance();
@@ -608,30 +592,36 @@ class _HomePageState extends State<HomePage> {
         'enabled': enabled,
       });
 
-      setState(() {
-        _chargingAnimationEnabled = enabled;
-      });
-      print('充电动画已${enabled ? "启用" : "禁用"}');
+      if (mounted) {
+        setState(() {
+          _chargingAnimationEnabled = enabled;
+        });
+      }
+      if (kDebugMode) debugPrint('充电动画已${enabled ? "启用" : "禁用"}');
     } catch (e) {
-      print('切换充电动画失败: $e');
+      if (kDebugMode) debugPrint('切换充电动画失败: $e');
       // 切换失败，恢复原状态
-      setState(() {
-        _chargingAnimationEnabled = !enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _chargingAnimationEnabled = !enabled;
+        });
+      }
     }
   }
 
   // V2.3: 启动充电服务
   Future<void> _startChargingService() async {
+    if (!mounted) return;
     try {
       await platform.invokeMethod('toggleChargingService', {'enabled': true});
     } catch (e) {
-      print('启动充电服务失败: $e');
+      if (kDebugMode) debugPrint('启动充电服务失败: $e');
     }
   }
 
   // V2.5: 切换背屏常亮开关
   Future<void> _toggleKeepScreenOn(bool enabled) async {
+    if (!mounted) return;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('keep_screen_on_enabled', enabled);
@@ -649,22 +639,27 @@ class _HomePageState extends State<HomePage> {
         'enabled': enabled,
       });
 
-      setState(() {
-        _keepScreenOnEnabled = enabled;
-        if (enabled) _alwaysWakeUpEnabled = false; // V3.5: 互斥关闭
-      });
-      print('背屏常亮已${enabled ? "启用" : "禁用"}');
+      if (mounted) {
+        setState(() {
+          _keepScreenOnEnabled = enabled;
+          if (enabled) _alwaysWakeUpEnabled = false; // V3.5: 互斥关闭
+        });
+      }
+      if (kDebugMode) debugPrint('背屏常亮已${enabled ? "启用" : "禁用"}');
     } catch (e) {
-      print('切换背屏常亮失败: $e');
+      if (kDebugMode) debugPrint('切换背屏常亮失败: $e');
       // 切换失败，恢复原状态
-      setState(() {
-        _keepScreenOnEnabled = !enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _keepScreenOnEnabled = !enabled;
+        });
+      }
     }
   }
 
   // V3.5: 切换未投放应用时常亮开关
   Future<void> _toggleAlwaysWakeUp(bool enabled) async {
+    if (!mounted) return;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('always_wakeup_enabled', enabled);
@@ -682,22 +677,27 @@ class _HomePageState extends State<HomePage> {
         'enabled': enabled,
       });
 
-      setState(() {
-        _alwaysWakeUpEnabled = enabled;
-        if (enabled) _keepScreenOnEnabled = false; // V3.5: 互斥关闭
-      });
-      print('未投放应用时常亮已${enabled ? "启用" : "禁用"}');
+      if (mounted) {
+        setState(() {
+          _alwaysWakeUpEnabled = enabled;
+          if (enabled) _keepScreenOnEnabled = false; // V3.5: 互斥关闭
+        });
+      }
+      if (kDebugMode) debugPrint('未投放应用时常亮已${enabled ? "启用" : "禁用"}');
     } catch (e) {
-      print('切换未投放应用时常亮失败: $e');
+      if (kDebugMode) debugPrint('切换未投放应用时常亮失败: $e');
       // 切换失败，恢复原状态
-      setState(() {
-        _alwaysWakeUpEnabled = !enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _alwaysWakeUpEnabled = !enabled;
+        });
+      }
     }
   }
 
   // V3.5: 切换充电动画常亮开关
   Future<void> _toggleChargingAlwaysOn(bool enabled) async {
+    if (!mounted) return;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('charging_always_on_enabled', enabled);
@@ -707,16 +707,20 @@ class _HomePageState extends State<HomePage> {
         'enabled': enabled,
       });
 
-      setState(() {
-        _chargingAlwaysOnEnabled = enabled;
-      });
-      print('充电动画常亮已${enabled ? "启用" : "禁用"}');
+      if (mounted) {
+        setState(() {
+          _chargingAlwaysOnEnabled = enabled;
+        });
+      }
+      if (kDebugMode) debugPrint('充电动画常亮已${enabled ? "启用" : "禁用"}');
     } catch (e) {
-      print('切换充电动画常亮失败: $e');
+      if (kDebugMode) debugPrint('切换充电动画常亮失败: $e');
       // 切换失败，恢复原状态
-      setState(() {
-        _chargingAlwaysOnEnabled = !enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _chargingAlwaysOnEnabled = !enabled;
+        });
+      }
     }
   }
 
@@ -782,7 +786,7 @@ class _HomePageState extends State<HomePage> {
                 CustomPaint(
                   painter: _SquircleBorderPainter(
                     radius: _SquircleRadii.large,
-                    color: Colors.white.withOpacity(0.5),
+                    color: Colors.white.withValues(alpha: 0.5),
                     strokeWidth: 1.5,
                   ),
                   child: ClipPath(
@@ -793,7 +797,7 @@ class _HomePageState extends State<HomePage> {
                       filter: ImageFilter.blur(sigmaX: 0, sigmaY: 0),
                       child: Container(
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.25),
+                          color: Colors.white.withValues(alpha: 0.25),
                         ),
                         padding: const EdgeInsets.all(16),
                         child: Column(
@@ -852,7 +856,7 @@ class _HomePageState extends State<HomePage> {
                     CustomPaint(
                       painter: _SquircleBorderPainter(
                         radius: _SquircleRadii.large,
-                        color: Colors.white.withOpacity(0.5),
+                        color: Colors.white.withValues(alpha: 0.5),
                         strokeWidth: 1.5,
                       ),
                       child: ClipPath(
@@ -863,7 +867,7 @@ class _HomePageState extends State<HomePage> {
                           filter: ImageFilter.blur(sigmaX: 0, sigmaY: 0),
                           child: Container(
                             decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.25),
+                              color: Colors.white.withValues(alpha: 0.25),
                             ),
                             padding: const EdgeInsets.all(20),
                             child: Column(
@@ -1137,7 +1141,7 @@ class _HomePageState extends State<HomePage> {
                     CustomPaint(
                       painter: _SquircleBorderPainter(
                         radius: _SquircleRadii.large,
-                        color: Colors.white.withOpacity(0.5),
+                        color: Colors.white.withValues(alpha: 0.5),
                         strokeWidth: 1.5,
                       ),
                       child: ClipPath(
@@ -1152,7 +1156,7 @@ class _HomePageState extends State<HomePage> {
                               vertical: 16,
                             ),
                             decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.25),
+                              color: Colors.white.withValues(alpha: 0.25),
                             ),
                             child: Row(
                               children: [
@@ -1186,7 +1190,7 @@ class _HomePageState extends State<HomePage> {
                 CustomPaint(
                   painter: _SquircleBorderPainter(
                     radius: _SquircleRadii.large,
-                    color: Colors.white.withOpacity(0.5),
+                    color: Colors.white.withValues(alpha: 0.5),
                     strokeWidth: 1.5,
                   ),
                   child: ClipPath(
@@ -1201,7 +1205,7 @@ class _HomePageState extends State<HomePage> {
                           vertical: 16,
                         ),
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.25),
+                          color: Colors.white.withValues(alpha: 0.25),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1254,12 +1258,12 @@ class _HomePageState extends State<HomePage> {
                               Container(
                                 padding: const EdgeInsets.all(12),
                                 decoration: BoxDecoration(
-                                  color: Colors.orange.withOpacity(0.2),
+                                  color: Colors.orange.withValues(alpha: 0.2),
                                   borderRadius: BorderRadius.circular(
                                     _SquircleRadii.small,
                                   ),
                                   border: Border.all(
-                                    color: Colors.orange.withOpacity(0.4),
+                                    color: Colors.orange.withValues(alpha: 0.4),
                                     width: 1,
                                   ),
                                 ),
@@ -1293,7 +1297,7 @@ class _HomePageState extends State<HomePage> {
                 CustomPaint(
                   painter: _SquircleBorderPainter(
                     radius: _SquircleRadii.large,
-                    color: Colors.white.withOpacity(0.5),
+                    color: Colors.white.withValues(alpha: 0.5),
                     strokeWidth: 1.5,
                   ),
                   child: ClipPath(
@@ -1308,7 +1312,7 @@ class _HomePageState extends State<HomePage> {
                           vertical: 16,
                         ),
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.25),
+                          color: Colors.white.withValues(alpha: 0.25),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1361,12 +1365,12 @@ class _HomePageState extends State<HomePage> {
                               Container(
                                 padding: const EdgeInsets.all(12),
                                 decoration: BoxDecoration(
-                                  color: Colors.orange.withOpacity(0.2),
+                                  color: Colors.orange.withValues(alpha: 0.2),
                                   borderRadius: BorderRadius.circular(
                                     _SquircleRadii.small,
                                   ),
                                   border: Border.all(
-                                    color: Colors.orange.withOpacity(0.4),
+                                    color: Colors.orange.withValues(alpha: 0.4),
                                     width: 1,
                                   ),
                                 ),
@@ -1400,7 +1404,7 @@ class _HomePageState extends State<HomePage> {
                 CustomPaint(
                   painter: _SquircleBorderPainter(
                     radius: _SquircleRadii.large,
-                    color: Colors.white.withOpacity(0.5),
+                    color: Colors.white.withValues(alpha: 0.5),
                     strokeWidth: 1.5,
                   ),
                   child: ClipPath(
@@ -1415,7 +1419,7 @@ class _HomePageState extends State<HomePage> {
                           vertical: 16,
                         ),
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.25),
+                          color: Colors.white.withValues(alpha: 0.25),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1465,7 +1469,7 @@ class _HomePageState extends State<HomePage> {
                 CustomPaint(
                   painter: _SquircleBorderPainter(
                     radius: _SquircleRadii.large,
-                    color: Colors.white.withOpacity(0.5),
+                    color: Colors.white.withValues(alpha: 0.5),
                     strokeWidth: 1.5,
                   ),
                   child: ClipPath(
@@ -1482,7 +1486,7 @@ class _HomePageState extends State<HomePage> {
                             try {
                               await platform.invokeMethod('openTutorial');
                             } catch (e) {
-                              print('打开教程失败: $e');
+                              if (kDebugMode) debugPrint('打开教程失败: $e');
                               if (context.mounted) {
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   const SnackBar(content: Text('打开失败')),
@@ -1490,11 +1494,11 @@ class _HomePageState extends State<HomePage> {
                               }
                             }
                           },
-                          splashColor: Colors.white.withOpacity(0.3),
-                          highlightColor: Colors.white.withOpacity(0.2),
+                          splashColor: Colors.white.withValues(alpha: 0.3),
+                          highlightColor: Colors.white.withValues(alpha: 0.2),
                           child: Container(
                             decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.25),
+                              color: Colors.white.withValues(alpha: 0.25),
                             ),
                             padding: const EdgeInsets.symmetric(
                               vertical: 12,
@@ -1539,7 +1543,7 @@ class _HomePageState extends State<HomePage> {
                 CustomPaint(
                   painter: _SquircleBorderPainter(
                     radius: _SquircleRadii.large,
-                    color: Colors.white.withOpacity(0.5),
+                    color: Colors.white.withValues(alpha: 0.5),
                     strokeWidth: 1.5,
                   ),
                   child: ClipPath(
@@ -1556,7 +1560,7 @@ class _HomePageState extends State<HomePage> {
                             try {
                               await platform.invokeMethod('openCoolApkProfile');
                             } catch (e) {
-                              print('打开酷安主页失败: $e');
+                              if (kDebugMode) debugPrint('打开酷安主页失败: $e');
                               if (context.mounted) {
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(
@@ -1570,11 +1574,11 @@ class _HomePageState extends State<HomePage> {
                               }
                             }
                           },
-                          splashColor: Colors.white.withOpacity(0.3),
-                          highlightColor: Colors.white.withOpacity(0.2),
+                          splashColor: Colors.white.withValues(alpha: 0.3),
+                          highlightColor: Colors.white.withValues(alpha: 0.2),
                           child: Container(
                             decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.25),
+                              color: Colors.white.withValues(alpha: 0.25),
                             ),
                             padding: const EdgeInsets.symmetric(
                               vertical: 12,
@@ -1632,7 +1636,7 @@ class _HomePageState extends State<HomePage> {
                 CustomPaint(
                   painter: _SquircleBorderPainter(
                     radius: _SquircleRadii.large,
-                    color: Colors.white.withOpacity(0.5),
+                    color: Colors.white.withValues(alpha: 0.5),
                     strokeWidth: 1.5,
                   ),
                   child: ClipPath(
@@ -1651,7 +1655,7 @@ class _HomePageState extends State<HomePage> {
                                 'openCoolApkProfileXmz',
                               );
                             } catch (e) {
-                              print('打开酷安主页失败: $e');
+                              if (kDebugMode) debugPrint('打开酷安主页失败: $e');
                               if (context.mounted) {
                                 ScaffoldMessenger.of(context).showSnackBar(
                                   SnackBar(
@@ -1665,11 +1669,11 @@ class _HomePageState extends State<HomePage> {
                               }
                             }
                           },
-                          splashColor: Colors.white.withOpacity(0.3),
-                          highlightColor: Colors.white.withOpacity(0.2),
+                          splashColor: Colors.white.withValues(alpha: 0.3),
+                          highlightColor: Colors.white.withValues(alpha: 0.2),
                           child: Container(
                             decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.25),
+                              color: Colors.white.withValues(alpha: 0.25),
                             ),
                             padding: const EdgeInsets.symmetric(
                               vertical: 12,
@@ -1731,7 +1735,7 @@ class _HomePageState extends State<HomePage> {
                       child: CustomPaint(
                         painter: _SquircleBorderPainter(
                           radius: _SquircleRadii.large,
-                          color: Colors.white.withOpacity(0.5),
+                          color: Colors.white.withValues(alpha: 0.5),
                           strokeWidth: 1.5,
                         ),
                         child: ClipPath(
@@ -1750,7 +1754,7 @@ class _HomePageState extends State<HomePage> {
                                       'openDonationPage',
                                     );
                                   } catch (e) {
-                                    print('打开打赏页面失败: $e');
+                                    if (kDebugMode) debugPrint('打开打赏页面失败: $e');
                                     if (context.mounted) {
                                       ScaffoldMessenger.of(
                                         context,
@@ -1766,11 +1770,15 @@ class _HomePageState extends State<HomePage> {
                                     }
                                   }
                                 },
-                                splashColor: Colors.white.withOpacity(0.3),
-                                highlightColor: Colors.white.withOpacity(0.2),
+                                splashColor: Colors.white.withValues(
+                                  alpha: 0.3,
+                                ),
+                                highlightColor: Colors.white.withValues(
+                                  alpha: 0.2,
+                                ),
                                 child: Container(
                                   decoration: BoxDecoration(
-                                    color: Colors.white.withOpacity(0.25),
+                                    color: Colors.white.withValues(alpha: 0.25),
                                   ),
                                   padding: const EdgeInsets.symmetric(
                                     vertical: 12,
@@ -1809,7 +1817,7 @@ class _HomePageState extends State<HomePage> {
                       child: CustomPaint(
                         painter: _SquircleBorderPainter(
                           radius: _SquircleRadii.large,
-                          color: Colors.white.withOpacity(0.5),
+                          color: Colors.white.withValues(alpha: 0.5),
                           strokeWidth: 1.5,
                         ),
                         child: ClipPath(
@@ -1826,7 +1834,7 @@ class _HomePageState extends State<HomePage> {
                                   try {
                                     await platform.invokeMethod('openQQGroup');
                                   } catch (e) {
-                                    print('打开交流群页面失败: $e');
+                                    if (kDebugMode) debugPrint('打开交流群页面失败: $e');
                                     if (context.mounted) {
                                       ScaffoldMessenger.of(
                                         context,
@@ -1842,11 +1850,15 @@ class _HomePageState extends State<HomePage> {
                                     }
                                   }
                                 },
-                                splashColor: Colors.white.withOpacity(0.3),
-                                highlightColor: Colors.white.withOpacity(0.2),
+                                splashColor: Colors.white.withValues(
+                                  alpha: 0.3,
+                                ),
+                                highlightColor: Colors.white.withValues(
+                                  alpha: 0.2,
+                                ),
                                 child: Container(
                                   decoration: BoxDecoration(
-                                    color: Colors.white.withOpacity(0.25),
+                                    color: Colors.white.withValues(alpha: 0.25),
                                   ),
                                   padding: const EdgeInsets.symmetric(
                                     vertical: 12,
@@ -1944,56 +1956,65 @@ class _HomePageState extends State<HomePage> {
 
   // V2.1: 获取当前旋转方向
   Future<void> _getCurrentRotation() async {
+    if (!mounted) return;
     try {
       final rotation = await platform.invokeMethod('getDisplayRotation', {
         'displayId': 1,
       });
       if (rotation != null && rotation >= 0) {
-        setState(() {
-          _currentRotation = rotation;
-        });
+        if (mounted) {
+          setState(() {
+            _currentRotation = rotation;
+          });
+        }
       }
     } catch (e) {
-      print('获取旋转方向失败: $e');
+      if (kDebugMode) debugPrint('获取旋转方向失败: $e');
     }
   }
 
   // V2.1: 设置旋转方向
   Future<void> _setRotation(int rotation) async {
-    print('[Flutter] 🔄 开始设置旋转: $rotation (${rotation * 90}°)');
+    if (!mounted) return;
+    if (kDebugMode) {
+      debugPrint('[Flutter] 🔄 开始设置旋转: $rotation (${rotation * 90}°)');
+    }
 
     if (!_shizukuRunning) {
-      print('[Flutter] ❌ Shizuku未运行');
+      if (kDebugMode) debugPrint('[Flutter] ❌ Shizuku未运行');
       return;
     }
     if (_isLoading) {
-      print('[Flutter] ⚠️ 正在加载中，跳过');
+      if (kDebugMode) debugPrint('[Flutter] ⚠️ 正在加载中，跳过');
       return;
     }
 
-    setState(() => _isLoading = true);
+    if (mounted) setState(() => _isLoading = true);
 
     try {
       // 确保TaskService连接
-      print('[Flutter] 🔗 确保TaskService连接...');
+      if (kDebugMode) debugPrint('[Flutter] 🔗 确保TaskService连接...');
       final connected = await platform.invokeMethod(
         'ensureTaskServiceConnected',
       );
-      print('[Flutter] 🔗 TaskService连接状态: $connected');
-      await Future.delayed(const Duration(milliseconds: 500));
+      if (kDebugMode) debugPrint('[Flutter] 🔗 TaskService连接状态: $connected');
+      if (!mounted) return;
+      if (connected != true) throw PlatformException(code: 'NOT_CONNECTED');
 
-      print(
-        '[Flutter] 📡 调用setDisplayRotation: displayId=1, rotation=$rotation',
-      );
+      if (kDebugMode) {
+        debugPrint(
+          '[Flutter] 📡 调用setDisplayRotation: displayId=1, rotation=$rotation',
+        );
+      }
       final result = await platform.invokeMethod('setDisplayRotation', {
         'displayId': 1,
         'rotation': rotation,
       });
-      print('[Flutter] 📡 setDisplayRotation返回: $result');
+      if (kDebugMode) debugPrint('[Flutter] 📡 setDisplayRotation返回: $result');
 
       if (result == true) {
-        setState(() => _currentRotation = rotation);
-        print('[Flutter] ✅ 旋转成功: ${rotation * 90}°');
+        if (mounted) setState(() => _currentRotation = rotation);
+        if (kDebugMode) debugPrint('[Flutter] ✅ 旋转成功: ${rotation * 90}°');
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -2005,7 +2026,7 @@ class _HomePageState extends State<HomePage> {
           );
         }
       } else {
-        print('[Flutter] ❌ 旋转失败: result=$result');
+        if (kDebugMode) debugPrint('[Flutter] ❌ 旋转失败: result=$result');
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -2017,7 +2038,7 @@ class _HomePageState extends State<HomePage> {
         }
       }
     } catch (e) {
-      print('[Flutter] ❌ 旋转异常: $e');
+      if (kDebugMode) debugPrint('[Flutter] ❌ 旋转异常: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -2028,8 +2049,8 @@ class _HomePageState extends State<HomePage> {
         );
       }
     } finally {
-      setState(() => _isLoading = false);
-      print('[Flutter] 🏁 旋转操作结束');
+      if (mounted) setState(() => _isLoading = false);
+      if (kDebugMode) debugPrint('[Flutter] 🏁 旋转操作结束');
     }
   }
 }
@@ -2055,8 +2076,8 @@ class _GradientToggleState extends State<_GradientToggle> {
         onTap: () => widget.onChanged(!widget.value),
         onHighlightChanged: (h) => setState(() => _pressed = h),
         customBorder: _SquircleShapeBorder(cornerRadius: _SquircleRadii.tiny),
-        splashColor: Colors.white.withOpacity(0.2),
-        highlightColor: Colors.white.withOpacity(0.1),
+        splashColor: Colors.white.withValues(alpha: 0.2),
+        highlightColor: Colors.white.withValues(alpha: 0.1),
         child: ClipPath(
           clipper: _SquircleClipper(cornerRadius: _SquircleRadii.tiny),
           child: SizedBox(
@@ -2065,7 +2086,7 @@ class _GradientToggleState extends State<_GradientToggle> {
             child: Stack(
               children: [
                 // Base background
-                Container(color: Colors.white.withOpacity(0.25)),
+                Container(color: Colors.white.withValues(alpha: 0.25)),
                 // Gradient overlay with fade
                 AnimatedOpacity(
                   duration: const Duration(milliseconds: 220),
@@ -2109,7 +2130,7 @@ class _GradientToggleState extends State<_GradientToggle> {
                           borderRadius: BorderRadius.circular(11),
                           boxShadow: [
                             BoxShadow(
-                              color: Colors.black.withOpacity(0.15),
+                              color: Colors.black.withValues(alpha: 0.15),
                               blurRadius: 3,
                               offset: const Offset(0, 1),
                             ),
@@ -2241,7 +2262,7 @@ class _GradientCheckboxState extends State<_GradientCheckbox> {
             child: Stack(
               children: [
                 // 底层半透明背景
-                Container(color: Colors.white.withOpacity(0.25)),
+                Container(color: Colors.white.withValues(alpha: 0.25)),
                 // 渐变层（淡入淡出）
                 AnimatedOpacity(
                   duration: const Duration(milliseconds: 200),
@@ -2268,7 +2289,7 @@ class _GradientCheckboxState extends State<_GradientCheckbox> {
                   child: CustomPaint(
                     painter: _SquircleBorderPainter(
                       radius: _SquircleRadii.checkbox,
-                      color: Colors.white.withOpacity(0.4),
+                      color: Colors.white.withValues(alpha: 0.4),
                       strokeWidth: 2,
                     ),
                   ),
@@ -2596,7 +2617,10 @@ class AppSelectionPage extends StatefulWidget {
   State<AppSelectionPage> createState() => _AppSelectionPageState();
 }
 
-class _AppSelectionPageState extends State<AppSelectionPage> {
+class _AppSelectionPageState extends State<AppSelectionPage>
+    with WidgetsBindingObserver {
+  bool _awaitingPermission = false;
+  bool _permissionCheckInFlight = false;
   static const platform = MethodChannel(
     'com.display.switcher/task',
   ); // ✅ 修正channel名称
@@ -2612,80 +2636,53 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadApps();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     super.dispose();
   }
 
-  // 启动权限检查循环（后台异步）
-  void _startPermissionCheckLoop() async {
-    print('→ 启动权限检查循环');
-    int checkAttempts = 0;
-
-    while (checkAttempts < 30 && mounted) {
-      // 最多检查30次（30秒）
-      await Future.delayed(const Duration(seconds: 1));
-
-      if (!mounted) break; // 页面已销毁，退出循环
-
-      try {
-        final bool granted = await platform.invokeMethod(
-          'checkQueryAllPackagesPermission',
-        );
-        if (granted) {
-          print('✓ 权限已授予，自动刷新应用列表');
-
-          // 权限已授予，刷新列表
-          if (mounted) {
-            setState(() {
-              _isLoading = true;
-            });
-
-            await _loadAppsInternal();
-
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  AppLocalizations.of(
-                    context,
-                  ).translate('permission_granted_refresh'),
-                ),
-              ),
-            );
-          }
-          return; // 成功，退出循环
-        }
-      } catch (e) {
-        print('权限检查失败: $e');
-      }
-
-      checkAttempts++;
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _awaitingPermission) {
+      _checkPendingPermission();
     }
+  }
 
-    print('⚠ 权限检查超时（30秒），用户可能未授予权限');
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            AppLocalizations.of(context).translate('grant_permission_manual'),
-          ),
-        ),
+  Future<void> _checkPendingPermission() async {
+    if (!mounted || !_awaitingPermission || _permissionCheckInFlight) return;
+    _permissionCheckInFlight = true;
+    try {
+      final granted = await platform.invokeMethod<bool>(
+        'checkQueryAllPackagesPermission',
       );
+      if (!mounted) return;
+      if (granted == true) {
+        _awaitingPermission = false;
+        setState(() => _isLoading = true);
+        await _loadAppsInternal();
+      }
+    } catch (e) {
+      if (kDebugMode) debugPrint('Permission recheck failed: $e');
+    } finally {
+      _permissionCheckInFlight = false;
     }
   }
 
   // 内部加载方法（不检查权限，直接加载）
   Future<void> _loadAppsInternal() async {
+    if (!mounted) return;
     try {
       // 加载已选择的应用
       final List<dynamic> selectedApps = await platform.invokeMethod(
         'getSelectedNotificationApps',
       );
+      if (!mounted) return;
       _selectedApps = selectedApps.cast<String>().toSet();
 
       // 加载所有应用
@@ -2693,23 +2690,28 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
         'getInstalledApps',
       );
 
-      setState(() {
-        _apps = apps.map((app) => Map<String, dynamic>.from(app)).toList();
-        _isLoading = false;
-      });
+      if (mounted) {
+        setState(() {
+          _apps = apps.map((app) => Map<String, dynamic>.from(app)).toList();
+          _isLoading = false;
+        });
+      }
 
       _applyFilters();
 
-      print('已加载 ${_apps.length} 个应用');
+      if (kDebugMode) debugPrint('已加载 ${_apps.length} 个应用');
     } catch (e) {
-      print('加载应用列表失败: $e');
-      setState(() {
-        _isLoading = false;
-      });
+      if (kDebugMode) debugPrint('加载应用列表失败: $e');
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
     }
   }
 
   void _applyFilters() {
+    if (!mounted) return;
     final String q = _searchController.text.trim().toLowerCase();
     List<Map<String, dynamic>> filtered = _apps.where((app) {
       final String name = (app['appName'] ?? '').toString().toLowerCase();
@@ -2739,9 +2741,11 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
       return nameA.compareTo(nameB);
     });
 
-    setState(() {
-      _visibleApps = filtered;
-    });
+    if (mounted) {
+      setState(() {
+        _visibleApps = filtered;
+      });
+    }
   }
 
   bool _isSystemApp(Map<String, dynamic> app) {
@@ -2755,6 +2759,7 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
   }
 
   Future<void> _selectAllVisible() async {
+    if (!mounted) return;
     setState(() {
       for (final app in _visibleApps) {
         final String pkg = app['packageName'];
@@ -2769,11 +2774,12 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
         _selectedApps.toList(),
       );
     } catch (e) {
-      print('批量全选保存失败: $e');
+      if (kDebugMode) debugPrint('批量全选保存失败: $e');
     }
   }
 
   Future<void> _deselectAllVisible() async {
+    if (!mounted) return;
     setState(() {
       for (final app in _visibleApps) {
         final String pkg = app['packageName'];
@@ -2788,25 +2794,27 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
         _selectedApps.toList(),
       );
     } catch (e) {
-      print('批量全不选保存失败: $e');
+      if (kDebugMode) debugPrint('批量全不选保存失败: $e');
     }
   }
 
   Future<void> _loadApps() async {
+    if (!mounted) return;
     setState(() => _isLoading = true);
 
     try {
       // ✅ 主动检查QUERY_ALL_PACKAGES权限
-      print('🔍 开始检查QUERY_ALL_PACKAGES权限...');
+      if (kDebugMode) debugPrint('🔍 开始检查QUERY_ALL_PACKAGES权限...');
       final bool hasPermission = await platform.invokeMethod(
         'checkQueryAllPackagesPermission',
       );
-      print('🔍 权限检查结果: $hasPermission');
+      if (!mounted) return;
+      if (kDebugMode) debugPrint('🔍 权限检查结果: $hasPermission');
 
       if (!hasPermission) {
-        print('❌ 没有QUERY_ALL_PACKAGES权限，显示弹窗');
+        if (kDebugMode) debugPrint('❌ 没有QUERY_ALL_PACKAGES权限，显示弹窗');
         // 没有权限，弹窗提示并跳转到设置
-        setState(() => _isLoading = false);
+        if (mounted) setState(() => _isLoading = false);
 
         if (mounted) {
           final shouldOpenSettings = await showDialog<bool>(
@@ -2837,11 +2845,12 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
             ),
           );
 
+          if (!mounted) return;
           if (shouldOpenSettings == true) {
+            _awaitingPermission = true;
             await platform.invokeMethod('requestQueryAllPackagesPermission');
-
-            // 启动后台检查任务（不阻塞UI）
-            _startPermissionCheckLoop();
+            if (!mounted) return;
+            _checkPendingPermission();
           }
         }
         return;
@@ -2850,12 +2859,13 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
       // ✅ 有权限，继续加载
       await _loadAppsInternal();
     } catch (e) {
-      print('加载应用列表失败: $e');
-      setState(() => _isLoading = false);
+      if (kDebugMode) debugPrint('加载应用列表失败: $e');
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
   Future<void> _toggleApp(String packageName, bool selected) async {
+    if (!mounted) return;
     setState(() {
       if (selected) {
         _selectedApps.add(packageName);
@@ -2874,7 +2884,7 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
         _selectedApps.toList(),
       );
     } catch (e) {
-      print('保存选择失败: $e');
+      if (kDebugMode) debugPrint('保存选择失败: $e');
     }
   }
 
@@ -2937,7 +2947,7 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
                       CustomPaint(
                         painter: _SquircleBorderPainter(
                           radius: 32,
-                          color: Colors.white.withOpacity(0.5),
+                          color: Colors.white.withValues(alpha: 0.5),
                           strokeWidth: 1.5,
                         ),
                         child: ClipPath(
@@ -2952,7 +2962,7 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
                                 vertical: 12,
                               ),
                               decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.25),
+                                color: Colors.white.withValues(alpha: 0.25),
                               ),
                               child: Column(
                                 children: [
@@ -3099,9 +3109,11 @@ class _AppSelectionPageState extends State<AppSelectionPage> {
                                       _GradientToggle(
                                         value: _includeSystemApps,
                                         onChanged: (v) {
-                                          setState(
-                                            () => _includeSystemApps = v,
-                                          );
+                                          if (mounted) {
+                                            setState(
+                                              () => _includeSystemApps = v,
+                                            );
+                                          }
                                           _applyFilters();
                                         },
                                       ),
@@ -3187,8 +3199,10 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
   }
 
   Future<void> _loadAllSettings() async {
+    if (!mounted) return;
     try {
       final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
       setState(() {
         _privacyHideTitle =
             prefs.getBool('notification_privacy_hide_title') ?? false;
@@ -3203,91 +3217,109 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
         _durationController.text = _notificationDuration.toString();
       });
     } catch (e) {
-      print('加载通知设置失败: $e');
+      if (kDebugMode) debugPrint('加载通知设置失败: $e');
     }
   }
 
   Future<void> _togglePrivacyHideTitle(bool enabled) async {
+    if (!mounted) return;
     try {
       await platform.invokeMethod('setNotificationPrivacyHideTitle', {
         'enabled': enabled,
       });
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('notification_privacy_hide_title', enabled);
-      setState(() {
-        _privacyHideTitle = enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _privacyHideTitle = enabled;
+        });
+      }
     } catch (e) {
-      print('切换隐藏标题失败: $e');
+      if (kDebugMode) debugPrint('切换隐藏标题失败: $e');
     }
   }
 
   Future<void> _togglePrivacyHideContent(bool enabled) async {
+    if (!mounted) return;
     try {
       await platform.invokeMethod('setNotificationPrivacyHideContent', {
         'enabled': enabled,
       });
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('notification_privacy_hide_content', enabled);
-      setState(() {
-        _privacyHideContent = enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _privacyHideContent = enabled;
+        });
+      }
     } catch (e) {
-      print('切换隐藏内容失败: $e');
+      if (kDebugMode) debugPrint('切换隐藏内容失败: $e');
     }
   }
 
   Future<void> _toggleFollowDndMode(bool enabled) async {
+    if (!mounted) return;
     try {
       await platform.invokeMethod('setFollowDndMode', {'enabled': enabled});
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('notification_follow_dnd_mode', enabled);
-      setState(() {
-        _followDndMode = enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _followDndMode = enabled;
+        });
+      }
     } catch (e) {
-      print('切换勿扰模式设置失败: $e');
+      if (kDebugMode) debugPrint('切换勿扰模式设置失败: $e');
     }
   }
 
   Future<void> _toggleOnlyWhenLocked(bool enabled) async {
+    if (!mounted) return;
     try {
       await platform.invokeMethod('setOnlyWhenLocked', {'enabled': enabled});
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('notification_only_when_locked', enabled);
-      setState(() {
-        _onlyWhenLocked = enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _onlyWhenLocked = enabled;
+        });
+      }
     } catch (e) {
-      print('切换倒扣手机通知设置失败: $e');
+      if (kDebugMode) debugPrint('切换倒扣手机通知设置失败: $e');
     }
   }
 
   Future<void> _toggleNotificationDarkMode(bool enabled) async {
+    if (!mounted) return;
     try {
       await platform.invokeMethod('setNotificationDarkMode', {
         'enabled': enabled,
       });
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool('notification_dark_mode', enabled);
-      setState(() {
-        _notificationDarkMode = enabled;
-      });
+      if (mounted) {
+        setState(() {
+          _notificationDarkMode = enabled;
+        });
+      }
     } catch (e) {
-      print('切换通知暗夜模式失败: $e');
+      if (kDebugMode) debugPrint('切换通知暗夜模式失败: $e');
     }
   }
 
   Future<void> _setNotificationDuration(int seconds) async {
+    if (!mounted) return;
     try {
       await platform.invokeMethod('setNotificationDuration', {
         'duration': seconds,
       });
       final prefs = await SharedPreferences.getInstance();
       await prefs.setInt('notification_duration', seconds);
-      setState(() {
-        _notificationDuration = seconds;
-      });
+      if (mounted) {
+        setState(() {
+          _notificationDuration = seconds;
+        });
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -3300,7 +3332,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
         );
       }
     } catch (e) {
-      print('设置通知销毁时间失败: $e');
+      if (kDebugMode) debugPrint('设置通知销毁时间失败: $e');
     }
   }
 
@@ -3342,7 +3374,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
               CustomPaint(
                 painter: _SquircleBorderPainter(
                   radius: 32,
-                  color: Colors.white.withOpacity(0.5),
+                  color: Colors.white.withValues(alpha: 0.5),
                   strokeWidth: 1.5,
                 ),
                 child: ClipPath(
@@ -3355,7 +3387,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
                         vertical: 16,
                       ),
                       decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.25),
+                        color: Colors.white.withValues(alpha: 0.25),
                       ),
                       child: Column(
                         children: [
@@ -3425,7 +3457,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
               CustomPaint(
                 painter: _SquircleBorderPainter(
                   radius: 32,
-                  color: Colors.white.withOpacity(0.5),
+                  color: Colors.white.withValues(alpha: 0.5),
                   strokeWidth: 1.5,
                 ),
                 child: ClipPath(
@@ -3438,7 +3470,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
                         vertical: 16,
                       ),
                       decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.25),
+                        color: Colors.white.withValues(alpha: 0.25),
                       ),
                       child: Row(
                         children: [
@@ -3476,7 +3508,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
               CustomPaint(
                 painter: _SquircleBorderPainter(
                   radius: 32,
-                  color: Colors.white.withOpacity(0.5),
+                  color: Colors.white.withValues(alpha: 0.5),
                   strokeWidth: 1.5,
                 ),
                 child: ClipPath(
@@ -3489,7 +3521,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
                         vertical: 16,
                       ),
                       decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.25),
+                        color: Colors.white.withValues(alpha: 0.25),
                       ),
                       child: Row(
                         children: [
@@ -3527,7 +3559,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
               CustomPaint(
                 painter: _SquircleBorderPainter(
                   radius: 32,
-                  color: Colors.white.withOpacity(0.5),
+                  color: Colors.white.withValues(alpha: 0.5),
                   strokeWidth: 1.5,
                 ),
                 child: ClipPath(
@@ -3540,7 +3572,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
                         vertical: 16,
                       ),
                       decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.25),
+                        color: Colors.white.withValues(alpha: 0.25),
                       ),
                       child: Row(
                         children: [
@@ -3578,7 +3610,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
               CustomPaint(
                 painter: _SquircleBorderPainter(
                   radius: 32,
-                  color: Colors.white.withOpacity(0.5),
+                  color: Colors.white.withValues(alpha: 0.5),
                   strokeWidth: 1.5,
                 ),
                 child: ClipPath(
@@ -3588,7 +3620,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
                     child: Container(
                       padding: const EdgeInsets.all(20),
                       decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.25),
+                        color: Colors.white.withValues(alpha: 0.25),
                       ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
