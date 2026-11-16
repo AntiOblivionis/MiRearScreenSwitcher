@@ -1,8 +1,8 @@
 /*
  * Author: AntiOblivionis
  * QQ: 319641317
- * Github: https://github.com/GoldenglowSusie/
- * Bilibili: 罗德岛T0驭械术师澄闪
+ * Github: https://github.com/AntiOblivionis/
+ * Bilibili: AntiOblivionis
  * 
  * Chief Tester: 汐木泽
  * 
@@ -406,7 +406,7 @@ public class MainActivity extends FlutterActivity {
                         // 打开打赏页面
                         try {
                             Intent intent = new Intent(Intent.ACTION_VIEW);
-                            intent.setData(android.net.Uri.parse("https://tgwgroup.ltd/2025/10/19/%e5%85%b3%e4%ba%8e%e6%89%93%e8%b5%8f/"));
+                            intent.setData(android.net.Uri.parse("https://tgwgroup.ltd/2025/10/19/support-me/"));
                             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                             startActivity(intent);
                             result.success(null);
@@ -421,7 +421,7 @@ public class MainActivity extends FlutterActivity {
                         // 打开MRSS交流群页面
                         try {
                             Intent intent = new Intent(Intent.ACTION_VIEW);
-                            intent.setData(android.net.Uri.parse("https://tgwgroup.ltd/2025/10/21/%e5%85%b3%e4%ba%8emrss%e4%ba%a4%e6%b5%81%e7%be%a4/"));
+                            intent.setData(android.net.Uri.parse("https://tgwgroup.ltd/2025/10/21/about-mrss-qq/"));
                             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                             startActivity(intent);
                             result.success(null);

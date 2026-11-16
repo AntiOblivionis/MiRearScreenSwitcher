@@ -1,8 +1,8 @@
 /*
  * Author: AntiOblivionis
  * QQ: 319641317
- * Github: https://github.com/GoldenglowSusie/
- * Bilibili: 罗德岛T0驭械术师澄闪
+ * Github: https://github.com/AntiOblivionis/
+ * Bilibili: AntiOblivionis
  *
  * Chief Tester: 汐木泽
  *
