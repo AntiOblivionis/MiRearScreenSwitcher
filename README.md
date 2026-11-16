@@ -353,8 +353,8 @@ flutter build apk --release --split-per-abi --target-platform android-arm64
 **AntiOblivionis**
 - 🎮 QQ: 319641317
 - 📱 酷安: [@AntiOblivionis](http://www.coolapk.com/u/8158212)
-- 🐙 Github: [GoldenglowSusie](https://github.com/GoldenglowSusie/)
-- 📺 Bilibili: [罗德岛T0驭械术师澄闪](https://space.bilibili.com/407059627)
+- 🐙 Github: [AntiOblivionis](https://github.com/AntiOblivionis/)
+- 📺 Bilibili: [AnntiOblivionis](https://space.bilibili.com/407059627)
 
 ### 首席测试官
 **汐木泽**
